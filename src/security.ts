@@ -48,11 +48,15 @@ export async function assertAllowed(input: string, forWrite = false): Promise<st
   throw new Error(`Access denied outside ROB_DC_ALLOWED_DIRS: ${resolved}`);
 }
 
+// Guardrail only: shell execution is intentionally powerful and is not a sandbox.
+// Match dangerous commands at the beginning of the command string or after common
+// shell command separators, so "echo ok; diskpart" is blocked as well.
+const COMMAND_BOUNDARY = String.raw`(?:^|[;&|\r\n]\s*)`;
 const BLOCKED = [
-  /^\s*(?:sudo\s+)?(?:mkfs(?:\.\w+)?|fdisk|parted|diskpart|format)(?:\s|$)/i,
-  /^\s*(?:shutdown|reboot|halt|poweroff)(?:\s|$)/i,
-  /^\s*(?:bcdedit|cipher\s+\/w)(?:\s|$)/i,
-  /^\s*(?:Stop-Computer|Restart-Computer)(?:\s|$)/i
+  new RegExp(COMMAND_BOUNDARY + String.raw`(?:sudo\s+)?(?:mkfs(?:\.\w+)?|fdisk|parted|diskpart|format(?:\.com)?)(?:\s|$)`, "i"),
+  new RegExp(COMMAND_BOUNDARY + String.raw`(?:shutdown|reboot|halt|poweroff)(?:\s|$)`, "i"),
+  new RegExp(COMMAND_BOUNDARY + String.raw`(?:bcdedit|cipher\s+\/w)(?:\s|$)`, "i"),
+  new RegExp(COMMAND_BOUNDARY + String.raw`(?:Stop-Computer|Restart-Computer)(?:\s|$)`, "i")
 ];
 
 export function assertCommandAllowed(command: string): void {

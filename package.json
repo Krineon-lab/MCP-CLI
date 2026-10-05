@@ -12,7 +12,8 @@
     "check": "tsc --noEmit",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "npm run build && node test/smoke.mjs",
+    "test": "npm run build && node test/security.mjs && node test/smoke.mjs",
+    "verify": "npm run check && npm test",
     "inspector": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "engines": {
