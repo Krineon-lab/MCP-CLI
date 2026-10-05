@@ -1,0 +1,32 @@
+{
+  "name": "rob-desktop-commander",
+  "version": "0.1.0",
+  "description": "Private, self-hosted MCP desktop control server for Rob",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "rob-desktop-commander": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "npm run build && node test/smoke.mjs",
+    "inspector": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "@vscode/ripgrep": "1.18.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
