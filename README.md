@@ -78,7 +78,8 @@ A short command should require one MCP call, not a `start_process` + `read_proce
 ## Install
 
 ```powershell
-cd C:\Users\c34k3\Desktop\IA\Krineon\MCP-CLI
+git clone https://github.com/Krineon-lab/MCP-CLI.git
+cd MCP-CLI
 npm install
 npm test
 ```
@@ -150,10 +151,10 @@ Any client that can launch a stdio MCP server can use:
     "rob-desktop-commander": {
       "command": "node",
       "args": [
-        "C:\\Users\\c34k3\\Desktop\\IA\\Krineon\\MCP-CLI\\dist\\index.js"
+        "C:\\path\\to\\MCP-CLI\\dist\\index.js"
       ],
       "env": {
-        "ROB_DC_ALLOWED_DIRS": "C:\\Users\\c34k3"
+        "ROB_DC_ALLOWED_DIRS": "C:\\Users\\your-user"
       }
     }
   }

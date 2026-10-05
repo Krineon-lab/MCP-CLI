@@ -128,6 +128,7 @@ export class ProcessManager {
       void this.kill(session.id);
     }, timeoutMs);
     timeout.unref();
+    void session.done.then(() => clearTimeout(timeout));
 
     const detached = await Promise.race([
       session.done.then(() => false),

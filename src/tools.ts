@@ -173,7 +173,8 @@ export function registerTools(server: McpServer): void {
         path: file,
         encoding,
         size: data.size,
-        sha256: sha256(data.buffer),
+        sha256: data.truncated ? null : sha256(data.buffer),
+        loadedSha256: sha256(data.buffer),
         offsetLine,
         returnedLines: selected.length,
         totalLoadedLines: lines.length,
@@ -258,8 +259,9 @@ export function registerTools(server: McpServer): void {
     },
     async ({ path: input, edits, expectedSha256 }) => safe(async () => {
       const file = await assertAllowed(input, true);
+      const stat = await fs.stat(file);
+      if (stat.size > config.maxReadBytes) throw new Error(`File exceeds fs_patch safety limit of ${config.maxReadBytes} bytes`);
       const originalBuffer = await fs.readFile(file);
-      if (originalBuffer.length > config.maxReadBytes) throw new Error(`File exceeds fs_patch safety limit of ${config.maxReadBytes} bytes`);
       const beforeHash = sha256(originalBuffer);
       if (expectedSha256 && beforeHash.toLowerCase() !== expectedSha256.toLowerCase()) {
         throw new Error(`SHA-256 precondition failed. Expected ${expectedSha256}, actual ${beforeHash}`);
@@ -383,8 +385,9 @@ export function registerTools(server: McpServer): void {
           const re = new RegExp(query, ignoreCase ? "i" : undefined);
           matcher = (value) => re.test(value);
         }
-        const matches = all.filter(matcher).slice(0, Math.min(maxResults, config.maxSearchResults));
-        return { root, mode, query, count: matches.length, truncated: matches.length < all.filter(matcher).length, matches };
+        const filtered = all.filter(matcher);
+        const matches = filtered.slice(0, Math.min(maxResults, config.maxSearchResults));
+        return { root, mode, query, count: matches.length, truncated: matches.length < filtered.length, matches };
       }
 
       const args = ["--line-number", "--column", "--no-heading", "--color", "never"];
