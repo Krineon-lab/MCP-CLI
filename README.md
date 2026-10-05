@@ -10,7 +10,10 @@ It is designed for Rob's workstation and deliberately avoids Desktop Commander's
 - No account, Supabase or telemetry dependency.
 - Current MCP SDK v2 over stdio.
 - Efficient tool surface: batch reads and single-call command execution.
-- Long-running commands automatically become persistent sessions.
+- Fair multi-project concurrency with separate process, search and filesystem-I/O pools.
+- Automatic workspace detection from Git/project roots, with per-workspace resource limits.
+- Long-running commands automatically become persistent sessions and keep their process slot until exit.
+- Same-file writes/patches are serialized while unrelated files remain parallel.
 - Optimistic concurrency for file writes/patches using SHA-256.
 - Fast local search through ripgrep.
 - Explicit safety scope and no inbound Internet listener.
@@ -68,6 +71,24 @@ A short command should require one MCP call, not a `start_process` + `read_proce
 - if the process exits, it returns stdout/stderr/exit code immediately;
 - if it is still running, it returns a `sessionId` and the same process continues in the background.
 
+## Multi-project concurrency
+
+Rob Desktop Commander v0.2 automatically groups work by **workspace**. It first looks upward for a `.git` root; if there is no Git root it falls back to common project markers such as `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, Maven and Gradle files.
+
+Work is then scheduled through independent fair pools:
+
+- processes: **8 global / 3 per workspace**;
+- ripgrep searches: **4 global / 2 per workspace**;
+- filesystem I/O: **24 global / 8 per workspace**.
+
+The queue is round-robin by workspace, not a single FIFO. A project that submits many operations therefore cannot place every later project behind its entire backlog.
+
+Persistent or auto-detached processes continue to consume their process slot until they actually exit. This prevents a burst of calls from silently creating an unbounded number of background builds, test runners or servers.
+
+Writes, patches, moves, copies and deletes also use keyed locks. Operations touching the same file/path are serialized; unrelated paths can proceed concurrently.
+
+`rob_status` exposes live global/per-workspace active and queued counts, pool limits and timeout statistics.
+
 ## Requirements
 
 - Node.js 20+
@@ -102,6 +123,13 @@ Environment variables:
 | `ROB_DC_SHELL` | `powershell.exe` on Windows | Shell for command tools |
 | `ROB_DC_TIMEOUT_MS` | `30000` | Default command lifetime |
 | `ROB_DC_DETACH_AFTER_MS` | `2500` | Delay before `exec` turns into a persistent session |
+| `ROB_DC_QUEUE_TIMEOUT_MS` | `15000` | Maximum wait for a saturated concurrency pool |
+| `ROB_DC_MAX_PROCESSES` | `8` | Maximum simultaneously running child processes across all projects |
+| `ROB_DC_MAX_PROCESSES_PER_WORKSPACE` | `3` | Maximum child processes for one project/workspace |
+| `ROB_DC_MAX_SEARCHES` | `4` | Maximum simultaneous ripgrep searches globally |
+| `ROB_DC_MAX_SEARCHES_PER_WORKSPACE` | `2` | Maximum simultaneous searches for one project |
+| `ROB_DC_MAX_IO` | `24` | Maximum simultaneous filesystem-I/O jobs globally |
+| `ROB_DC_MAX_IO_PER_WORKSPACE` | `8` | Maximum filesystem-I/O jobs for one project |
 | `ROB_DC_MAX_OUTPUT_CHARS` | `1000000` | Per-stream output protection |
 | `ROB_DC_MAX_READ_BYTES` | `2000000` | File read/patch safety limit |
 | `ROB_DC_MAX_SEARCH_RESULTS` | `500` | Global search result cap |
@@ -181,7 +209,7 @@ npm test
 npm run inspector
 ```
 
-The smoke test launches a real MCP client, completes the MCP handshake, lists the tools, calls `rob_status`, reads `package.json` and runs `node --version` through `exec`.
+The test suite includes security regressions, scheduler fairness/locking tests, a real concurrent MCP test across two workspaces, and the normal MCP smoke test. The launch scripts also default `UV_THREADPOOL_SIZE` to 8 to give concurrent filesystem work more headroom on Windows.
 
 ## License
 

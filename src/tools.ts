@@ -8,6 +8,8 @@ import * as z from "zod/v4";
 import { config, SERVER_NAME, VERSION } from "./config.js";
 import { assertAllowed, truncate } from "./security.js";
 import { processes } from "./process-manager.js";
+import { concurrencySnapshot, fileLocks, ioPool, searchPool } from "./resource-manager.js";
+import { workspaceForPath } from "./workspace.js";
 
 function ok(data: unknown) {
   return {
@@ -29,6 +31,22 @@ async function safe(fn: () => Promise<unknown>) {
   } catch (error) {
     return fail(error);
   }
+}
+
+async function runIo<T>(
+  targetPath: string,
+  fn: (workspace: string, queueWaitMs: number) => Promise<T>
+): Promise<T> {
+  const workspace = await workspaceForPath(targetPath);
+  return await ioPool.run(workspace, (queueWaitMs) => fn(workspace, queueWaitMs), config.queueTimeoutMs);
+}
+
+async function runSearch<T>(
+  targetPath: string,
+  fn: (workspace: string, queueWaitMs: number) => Promise<T>
+): Promise<T> {
+  const workspace = await workspaceForPath(targetPath);
+  return await searchPool.run(workspace, (queueWaitMs) => fn(workspace, queueWaitMs), config.queueTimeoutMs);
 }
 
 async function readLimited(file: string, maxBytes = config.maxReadBytes): Promise<{ buffer: Buffer; truncated: boolean; size: number }> {
@@ -139,9 +157,11 @@ export function registerTools(server: McpServer): void {
       defaults: {
         timeoutMs: config.defaultTimeoutMs,
         detachAfterMs: config.detachAfterMs,
+        queueTimeoutMs: config.queueTimeoutMs,
         maxOutputChars: config.maxOutputChars,
         maxReadBytes: config.maxReadBytes
       },
+      concurrency: concurrencySnapshot(),
       sessions: processes.list()
     }))
   );
@@ -161,27 +181,31 @@ export function registerTools(server: McpServer): void {
     },
     async ({ path: input, encoding, offsetLine, maxLines, maxBytes }) => safe(async () => {
       const file = await assertAllowed(input);
-      const data = await readLimited(file, maxBytes ?? config.maxReadBytes);
-      if (encoding === "base64") {
-        return { path: file, encoding, size: data.size, truncated: data.truncated, content: data.buffer.toString("base64") };
-      }
-      const text = data.buffer.toString("utf8");
-      const lines = text.split(/\r?\n/);
-      const start = offsetLine - 1;
-      const selected = lines.slice(start, start + maxLines);
-      return {
-        path: file,
-        encoding,
-        size: data.size,
-        sha256: data.truncated ? null : sha256(data.buffer),
-        loadedSha256: sha256(data.buffer),
-        offsetLine,
-        returnedLines: selected.length,
-        totalLoadedLines: lines.length,
-        truncatedByBytes: data.truncated,
-        hasMoreLines: start + selected.length < lines.length || data.truncated,
-        content: selected.join("\n")
-      };
+      return await runIo(file, async (workspace, queueWaitMs) => {
+        const data = await readLimited(file, maxBytes ?? config.maxReadBytes);
+        if (encoding === "base64") {
+          return { path: file, workspace, queueWaitMs, encoding, size: data.size, truncated: data.truncated, content: data.buffer.toString("base64") };
+        }
+        const text = data.buffer.toString("utf8");
+        const lines = text.split(/\r?\n/);
+        const start = offsetLine - 1;
+        const selected = lines.slice(start, start + maxLines);
+        return {
+          path: file,
+          workspace,
+          queueWaitMs,
+          encoding,
+          size: data.size,
+          sha256: data.truncated ? null : sha256(data.buffer),
+          loadedSha256: sha256(data.buffer),
+          offsetLine,
+          returnedLines: selected.length,
+          totalLoadedLines: lines.length,
+          truncatedByBytes: data.truncated,
+          hasMoreLines: start + selected.length < lines.length || data.truncated,
+          content: selected.join("\n")
+        };
+      });
     })
   );
 
@@ -199,8 +223,10 @@ export function registerTools(server: McpServer): void {
       const results = await Promise.all(paths.map(async (input) => {
         try {
           const file = await assertAllowed(input);
-          const data = await readLimited(file, maxBytesEach);
-          return { path: file, size: data.size, truncated: data.truncated, content: data.buffer.toString("utf8") };
+          return await runIo(file, async (workspace, queueWaitMs) => {
+            const data = await readLimited(file, maxBytesEach);
+            return { path: file, workspace, queueWaitMs, size: data.size, truncated: data.truncated, content: data.buffer.toString("utf8") };
+          });
         } catch (error) {
           return { path: input, error: error instanceof Error ? error.message : String(error) };
         }
@@ -225,20 +251,24 @@ export function registerTools(server: McpServer): void {
     },
     async ({ path: input, content, mode, createParents, atomic, expectedSha256 }) => safe(async () => {
       const file = await assertAllowed(input, true);
-      if (createParents) await fs.mkdir(path.dirname(file), { recursive: true });
-      const before = await fileHash(file);
-      if (expectedSha256 && before?.toLowerCase() !== expectedSha256.toLowerCase()) {
-        throw new Error(`SHA-256 precondition failed. Expected ${expectedSha256}, actual ${before ?? "<missing>"}`);
-      }
-      if (mode === "append") {
-        await fs.appendFile(file, content, "utf8");
-      } else if (atomic) {
-        await atomicWrite(file, content);
-      } else {
-        await fs.writeFile(file, content, "utf8");
-      }
-      const after = await fileHash(file);
-      return { path: file, mode, bytesWritten: Buffer.byteLength(content), sha256Before: before, sha256After: after };
+      return await fileLocks.withKeys([file], async () =>
+        await runIo(file, async (workspace, queueWaitMs) => {
+          if (createParents) await fs.mkdir(path.dirname(file), { recursive: true });
+          const before = await fileHash(file);
+          if (expectedSha256 && before?.toLowerCase() !== expectedSha256.toLowerCase()) {
+            throw new Error(`SHA-256 precondition failed. Expected ${expectedSha256}, actual ${before ?? "<missing>"}`);
+          }
+          if (mode === "append") {
+            await fs.appendFile(file, content, "utf8");
+          } else if (atomic) {
+            await atomicWrite(file, content);
+          } else {
+            await fs.writeFile(file, content, "utf8");
+          }
+          const after = await fileHash(file);
+          return { path: file, workspace, queueWaitMs, mode, bytesWritten: Buffer.byteLength(content), sha256Before: before, sha256After: after };
+        })
+      );
     })
   );
 
@@ -259,25 +289,29 @@ export function registerTools(server: McpServer): void {
     },
     async ({ path: input, edits, expectedSha256 }) => safe(async () => {
       const file = await assertAllowed(input, true);
-      const stat = await fs.stat(file);
-      if (stat.size > config.maxReadBytes) throw new Error(`File exceeds fs_patch safety limit of ${config.maxReadBytes} bytes`);
-      const originalBuffer = await fs.readFile(file);
-      const beforeHash = sha256(originalBuffer);
-      if (expectedSha256 && beforeHash.toLowerCase() !== expectedSha256.toLowerCase()) {
-        throw new Error(`SHA-256 precondition failed. Expected ${expectedSha256}, actual ${beforeHash}`);
-      }
-      let text = originalBuffer.toString("utf8");
-      const applied: Array<{ expected: number; matches: number }> = [];
-      for (const edit of edits) {
-        const matches = text.split(edit.oldText).length - 1;
-        if (matches !== edit.expected) {
-          throw new Error(`Patch precondition failed: expected ${edit.expected} match(es), found ${matches}`);
-        }
-        text = text.split(edit.oldText).join(edit.newText);
-        applied.push({ expected: edit.expected, matches });
-      }
-      await atomicWrite(file, text);
-      return { path: file, editsApplied: applied.length, replacements: applied.reduce((n, x) => n + x.matches, 0), sha256Before: beforeHash, sha256After: sha256(text) };
+      return await fileLocks.withKeys([file], async () =>
+        await runIo(file, async (workspace, queueWaitMs) => {
+          const stat = await fs.stat(file);
+          if (stat.size > config.maxReadBytes) throw new Error(`File exceeds fs_patch safety limit of ${config.maxReadBytes} bytes`);
+          const originalBuffer = await fs.readFile(file);
+          const beforeHash = sha256(originalBuffer);
+          if (expectedSha256 && beforeHash.toLowerCase() !== expectedSha256.toLowerCase()) {
+            throw new Error(`SHA-256 precondition failed. Expected ${expectedSha256}, actual ${beforeHash}`);
+          }
+          let text = originalBuffer.toString("utf8");
+          const applied: Array<{ expected: number; matches: number }> = [];
+          for (const edit of edits) {
+            const matches = text.split(edit.oldText).length - 1;
+            if (matches !== edit.expected) {
+              throw new Error(`Patch precondition failed: expected ${edit.expected} match(es), found ${matches}`);
+            }
+            text = text.split(edit.oldText).join(edit.newText);
+            applied.push({ expected: edit.expected, matches });
+          }
+          await atomicWrite(file, text);
+          return { path: file, workspace, queueWaitMs, editsApplied: applied.length, replacements: applied.reduce((n, x) => n + x.matches, 0), sha256Before: beforeHash, sha256After: sha256(text) };
+        })
+      );
     })
   );
 
@@ -294,9 +328,11 @@ export function registerTools(server: McpServer): void {
     },
     async ({ path: input, depth, maxEntries }) => safe(async () => {
       const root = await assertAllowed(input);
-      const stat = await fs.stat(root);
-      if (!stat.isDirectory()) throw new Error(`Not a directory: ${root}`);
-      return { root, ...(await listTree(root, depth, maxEntries)) };
+      return await runIo(root, async (workspace, queueWaitMs) => {
+        const stat = await fs.stat(root);
+        if (!stat.isDirectory()) throw new Error(`Not a directory: ${root}`);
+        return { root, workspace, queueWaitMs, ...(await listTree(root, depth, maxEntries)) };
+      });
     })
   );
 
@@ -316,39 +352,49 @@ export function registerTools(server: McpServer): void {
     async ({ operation, path: input, destination, recursive, force }) => safe(async () => {
       const source = await assertAllowed(input, operation !== "stat");
       if (operation === "stat") {
-        const s = await fs.stat(source);
-        return {
-          path: source,
-          type: s.isFile() ? "file" : s.isDirectory() ? "directory" : "other",
-          size: s.size,
-          createdAt: s.birthtime.toISOString(),
-          modifiedAt: s.mtime.toISOString(),
-          sha256: s.isFile() && s.size <= config.maxReadBytes ? await fileHash(source) : undefined
-        };
+        return await runIo(source, async (workspace, queueWaitMs) => {
+          const s = await fs.stat(source);
+          return {
+            path: source,
+            workspace,
+            queueWaitMs,
+            type: s.isFile() ? "file" : s.isDirectory() ? "directory" : "other",
+            size: s.size,
+            createdAt: s.birthtime.toISOString(),
+            modifiedAt: s.mtime.toISOString(),
+            sha256: s.isFile() && s.size <= config.maxReadBytes ? await fileHash(source) : undefined
+          };
+        });
       }
-      if (operation === "mkdir") {
-        await fs.mkdir(source, { recursive: true });
-        return { operation, path: source };
-      }
-      if (operation === "delete") {
-        await fs.rm(source, { recursive, force });
-        return { operation, path: source, recursive, force };
-      }
-      if (!destination) throw new Error("destination is required for move/copy");
-      const target = await assertAllowed(destination, true);
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      if (operation === "copy") {
-        await fs.cp(source, target, { recursive, force });
-      } else {
-        try {
-          await fs.rename(source, target);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-          await fs.cp(source, target, { recursive: true, force: true });
-          await fs.rm(source, { recursive: true, force: true });
-        }
-      }
-      return { operation, path: source, destination: target };
+
+      const target = destination ? await assertAllowed(destination, true) : undefined;
+      const lockKeys = target ? [source, target] : [source];
+      return await fileLocks.withKeys(lockKeys, async () =>
+        await runIo(source, async (workspace, queueWaitMs) => {
+          if (operation === "mkdir") {
+            await fs.mkdir(source, { recursive: true });
+            return { operation, path: source, workspace, queueWaitMs };
+          }
+          if (operation === "delete") {
+            await fs.rm(source, { recursive, force });
+            return { operation, path: source, workspace, queueWaitMs, recursive, force };
+          }
+          if (!target) throw new Error("destination is required for move/copy");
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          if (operation === "copy") {
+            await fs.cp(source, target, { recursive, force });
+          } else {
+            try {
+              await fs.rename(source, target);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+              await fs.cp(source, target, { recursive: true, force: true });
+              await fs.rm(source, { recursive: true, force: true });
+            }
+          }
+          return { operation, path: source, destination: target, workspace, queueWaitMs };
+        })
+      );
     })
   );
 
@@ -370,37 +416,39 @@ export function registerTools(server: McpServer): void {
     },
     async ({ path: input, query, mode, glob, literal, ignoreCase, includeHidden, maxResults }) => safe(async () => {
       const root = await assertAllowed(input);
-      if (mode === "name") {
-        const args = ["--files", "--color", "never"];
+      return await runSearch(root, async (workspace, queueWaitMs) => {
+        if (mode === "name") {
+          const args = ["--files", "--color", "never"];
+          if (includeHidden) args.push("--hidden");
+          if (glob) args.push("-g", glob);
+          const result = await runRg(args, root);
+          if (result.code > 1) throw new Error(result.stderr || `ripgrep failed with exit code ${result.code}`);
+          const all = result.stdout.split(/\r?\n/).filter(Boolean);
+          let matcher: (value: string) => boolean;
+          if (literal) {
+            const needle = ignoreCase ? query.toLowerCase() : query;
+            matcher = (value) => (ignoreCase ? value.toLowerCase() : value).includes(needle);
+          } else {
+            const re = new RegExp(query, ignoreCase ? "i" : undefined);
+            matcher = (value) => re.test(value);
+          }
+          const filtered = all.filter(matcher);
+          const matches = filtered.slice(0, Math.min(maxResults, config.maxSearchResults));
+          return { root, workspace, queueWaitMs, mode, query, count: matches.length, truncated: matches.length < filtered.length, matches };
+        }
+
+        const args = ["--line-number", "--column", "--no-heading", "--color", "never"];
         if (includeHidden) args.push("--hidden");
+        if (ignoreCase) args.push("-i");
+        if (literal) args.push("-F");
         if (glob) args.push("-g", glob);
+        args.push("--", query, ".");
         const result = await runRg(args, root);
         if (result.code > 1) throw new Error(result.stderr || `ripgrep failed with exit code ${result.code}`);
-        const all = result.stdout.split(/\r?\n/).filter(Boolean);
-        let matcher: (value: string) => boolean;
-        if (literal) {
-          const needle = ignoreCase ? query.toLowerCase() : query;
-          matcher = (value) => (ignoreCase ? value.toLowerCase() : value).includes(needle);
-        } else {
-          const re = new RegExp(query, ignoreCase ? "i" : undefined);
-          matcher = (value) => re.test(value);
-        }
-        const filtered = all.filter(matcher);
-        const matches = filtered.slice(0, Math.min(maxResults, config.maxSearchResults));
-        return { root, mode, query, count: matches.length, truncated: matches.length < filtered.length, matches };
-      }
-
-      const args = ["--line-number", "--column", "--no-heading", "--color", "never"];
-      if (includeHidden) args.push("--hidden");
-      if (ignoreCase) args.push("-i");
-      if (literal) args.push("-F");
-      if (glob) args.push("-g", glob);
-      args.push("--", query, ".");
-      const result = await runRg(args, root);
-      if (result.code > 1) throw new Error(result.stderr || `ripgrep failed with exit code ${result.code}`);
-      const limit = Math.min(maxResults, config.maxSearchResults);
-      const lines = result.stdout.split(/\r?\n/).filter(Boolean);
-      return { root, mode, query, count: Math.min(lines.length, limit), truncated: result.truncated || lines.length > limit, matches: lines.slice(0, limit) };
+        const limit = Math.min(maxResults, config.maxSearchResults);
+        const lines = result.stdout.split(/\r?\n/).filter(Boolean);
+        return { root, workspace, queueWaitMs, mode, query, count: Math.min(lines.length, limit), truncated: result.truncated || lines.length > limit, matches: lines.slice(0, limit) };
+      });
     })
   );
 
@@ -435,7 +483,14 @@ export function registerTools(server: McpServer): void {
     },
     async ({ command, cwd, shell }) => safe(async () => {
       const session = await processes.start(command, cwd, shell);
-      return { sessionId: session.id, pid: session.child.pid, command: session.command, cwd: session.cwd };
+      return {
+        sessionId: session.id,
+        pid: session.child.pid,
+        command: session.command,
+        cwd: session.cwd,
+        workspace: session.workspace,
+        queueWaitMs: session.queueWaitMs
+      };
     })
   );
 

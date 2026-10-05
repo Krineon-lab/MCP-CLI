@@ -17,6 +17,7 @@ if (Test-Path $LocalTunnel) {
 Set-Location $Root
 npm run build
 if (-not $env:ROB_DC_ALLOWED_DIRS) { $env:ROB_DC_ALLOWED_DIRS = $env:USERPROFILE }
+if (-not $env:UV_THREADPOOL_SIZE) { $env:UV_THREADPOOL_SIZE = "8" }
 
 $McpCommand = 'node "' + $Server + '"'
 & $TunnelClient init --sample sample_mcp_stdio_local --profile rob-desktop --tunnel-id $env:ROB_TUNNEL_ID --mcp-command $McpCommand

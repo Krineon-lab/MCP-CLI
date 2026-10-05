@@ -2,7 +2,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import { config } from "./config.js";
+import { processPool } from "./resource-manager.js";
 import { assertAllowed, assertCommandAllowed, truncate } from "./security.js";
+import { workspaceForPath } from "./workspace.js";
+import type { Lease } from "./concurrency.js";
 
 export type StreamName = "stdout" | "stderr";
 
@@ -18,6 +21,9 @@ interface Session {
   child: ChildProcessWithoutNullStreams;
   command: string;
   cwd: string;
+  workspace: string;
+  queueWaitMs: number;
+  capacityLease: Lease;
   startedAt: number;
   events: OutputEvent[];
   nextSeq: number;
@@ -38,6 +44,8 @@ export interface ExecResult {
   stderr: string;
   truncated: boolean;
   durationMs: number;
+  workspace: string;
+  queueWaitMs: number;
 }
 
 export class ProcessManager {
@@ -66,15 +74,23 @@ export class ProcessManager {
     assertCommandAllowed(command);
     const actualCwd = await assertAllowed(cwd || os.homedir());
     const actualShell = shell || config.defaultShell;
+    const workspace = await workspaceForPath(actualCwd);
+    const capacityLease = await processPool.acquire(workspace, config.queueTimeoutMs);
     const id = randomUUID();
 
-    const child = spawn(command, [], {
-      cwd: actualCwd,
-      shell: actualShell,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env
-    });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(command, [], {
+        cwd: actualCwd,
+        shell: actualShell,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env
+      });
+    } catch (error) {
+      capacityLease.release();
+      throw error;
+    }
 
     let resolveDone!: () => void;
     const done = new Promise<void>((resolve) => { resolveDone = resolve; });
@@ -83,6 +99,9 @@ export class ProcessManager {
       child,
       command,
       cwd: actualCwd,
+      workspace,
+      queueWaitMs: capacityLease.waitedMs,
+      capacityLease,
       startedAt: Date.now(),
       events: [],
       nextSeq: 0,
@@ -101,6 +120,7 @@ export class ProcessManager {
       session.exitCode = code;
       session.signal = signal;
       session.finishedAt = Date.now();
+      session.capacityLease.release();
       resolveDone();
       const cleanup = setTimeout(() => this.sessions.delete(id), 10 * 60_000);
       cleanup.unref();
@@ -144,7 +164,9 @@ export class ProcessManager {
         exitCode: null,
         signal: null,
         ...output,
-        durationMs: Date.now() - session.startedAt
+        durationMs: Date.now() - session.startedAt,
+        workspace: session.workspace,
+        queueWaitMs: session.queueWaitMs
       };
     }
 
@@ -161,7 +183,9 @@ export class ProcessManager {
       exitCode: session.exitCode,
       signal: session.signal,
       ...output,
-      durationMs: (session.finishedAt ?? Date.now()) - session.startedAt
+      durationMs: (session.finishedAt ?? Date.now()) - session.startedAt,
+      workspace: session.workspace,
+      queueWaitMs: session.queueWaitMs
     };
   }
 
@@ -177,6 +201,8 @@ export class ProcessManager {
     running: boolean;
     exitCode: number | null;
     signal: NodeJS.Signals | null;
+    workspace: string;
+    queueWaitMs: number;
     cursor: number;
     events: OutputEvent[];
   } {
@@ -191,6 +217,8 @@ export class ProcessManager {
       running: session.finishedAt === null,
       exitCode: session.exitCode,
       signal: session.signal,
+      workspace: session.workspace,
+      queueWaitMs: session.queueWaitMs,
       cursor: nextCursor,
       events
     };
@@ -214,12 +242,14 @@ export class ProcessManager {
     }
   }
 
-  list(): Array<{ sessionId: string; pid?: number; command: string; cwd: string; running: boolean; startedAt: string; exitCode: number | null }> {
+  list(): Array<{ sessionId: string; pid?: number; command: string; cwd: string; workspace: string; queueWaitMs: number; running: boolean; startedAt: string; exitCode: number | null }> {
     return [...this.sessions.values()].map((s) => ({
       sessionId: s.id,
       pid: s.child.pid,
       command: s.command,
       cwd: s.cwd,
+      workspace: s.workspace,
+      queueWaitMs: s.queueWaitMs,
       running: s.finishedAt === null,
       startedAt: new Date(s.startedAt).toISOString(),
       exitCode: s.exitCode
