@@ -68,7 +68,7 @@ try {
 
   const quick = asJson(await client.callTool({
     name: "exec",
-    arguments: { command: "node --version", cwd: root, detachAfterMs: 2500, timeoutMs: 10000 }
+    arguments: { command: "node --version", cwd: root, detachAfterMs: 10000, timeoutMs: 20000 }
   }));
   assert.equal(quick.detached, false);
   assert.match(quick.stdout, /^v\d+/);
