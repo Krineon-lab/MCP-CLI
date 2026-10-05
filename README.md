@@ -1,22 +1,23 @@
 # Rob Desktop Commander
 
-**Rob Desktop Commander** is a private, self-hosted Model Context Protocol (MCP) server for controlling a computer from an MCP-capable AI client.
+**Rob Desktop Commander** is a private, self-hosted Model Context Protocol (MCP) server for controlling a workstation from an MCP-capable AI client.
 
-It is designed for Rob's workstation and deliberately avoids Desktop Commander's hosted Remote MCP relay, account service, telemetry and monthly provider quota.
+It is designed to replace the hosted Remote Desktop Commander relay for Rob's workflows: no provider account dependency, no telemetry service, no third-party relay quota, and a tool surface optimized for repeated software-project work.
 
-## Design goals
+## Current version
 
-- No third-party relay quota.
-- No account, Supabase or telemetry dependency.
-- Current MCP SDK v2 over stdio.
-- Efficient tool surface: batch reads and single-call command execution.
-- Fair multi-project concurrency with separate process, search and filesystem-I/O pools.
-- Automatic workspace detection from Git/project roots, with per-workspace resource limits.
-- Long-running commands automatically become persistent sessions and keep their process slot until exit.
-- Same-file writes/patches are serialized while unrelated files remain parallel.
-- Optimistic concurrency for file writes/patches using SHA-256.
-- Fast local search through ripgrep.
-- Explicit safety scope and no inbound Internet listener.
+**v0.3.0**
+
+Core goals:
+
+- efficient single-call operations instead of unnecessary MCP round-trips;
+- fair multi-project concurrency;
+- bounded queues and output buffers;
+- safe concurrent file editing;
+- efficient streaming search;
+- detailed optional JSONL diagnostics;
+- no inbound public MCP listener;
+- Windows-first behavior while remaining cross-platform.
 
 ## Architecture
 
@@ -35,66 +36,243 @@ tunnel-client
         v
 Rob Desktop Commander
         |
+        +-- workspace-aware scheduler
         +-- filesystem
-        +-- ripgrep search
-        +-- PowerShell / shell
-        +-- persistent processes
+        +-- streaming ripgrep
+        +-- PowerShell / shell processes
+        +-- persistent process sessions
+        +-- metrics + optional debug JSONL logs
 ```
 
-Rob Desktop Commander itself only speaks MCP over **stdio**. For ChatGPT, the recommended remote transport is OpenAI Secure MCP Tunnel, so the PC does not need an inbound public port.
+Rob Desktop Commander itself speaks MCP over **stdio**. It does not open an inbound network port.
 
-## Tools
+## Tool surface
+
+The v0.3 surface deliberately stays compact even after adding batch operations.
 
 | Tool | Purpose |
 | --- | --- |
-| `rob_status` | Runtime/config/session diagnostics |
-| `fs_read` | Read one text/binary file |
-| `fs_read_many` | Batch-read up to 64 files in one MCP call |
-| `fs_write` | Atomic create/overwrite/append with optional SHA guard |
-| `fs_patch` | Exact multi-edit patch, validated then written once |
-| `fs_list` | Bounded recursive directory listing |
+| `rob_status` | Runtime, concurrency, logging and optional performance/session diagnostics |
+| `rob_logging` | Runtime logging status / enable / disable / flush / log-level control |
+| `fs_read` | Efficient text range, tail, or base64-prefix read; hashing opt-in |
+| `fs_read_many` | Batch-read multiple UTF-8 file prefixes |
+| `fs_write` | Atomic write/append with optional SHA-256 precondition |
+| `fs_write_many` | Concurrent multi-file creation/update in one MCP call |
+| `fs_patch` | Exact validated patch of one file **or multiple files in parallel** |
+| `fs_list` | Bounded tree listing with common generated directories excluded by default |
 | `fs_manage` | stat/mkdir/move/copy/delete |
-| `search` | Fast filename/content search via ripgrep |
-| `exec` | Run a command; return directly or auto-detach to a session |
-| `process_start` | Explicit long-running/interactive process start |
-| `process_read` | Incremental output read |
-| `process_input` | Send stdin |
-| `process_kill` | Kill process tree |
-| `process_list` | List sessions |
+| `search` | Streaming ripgrep content, filename, or files-with-matches search |
+| `workspace_inspect` | One-call project root + Git status + manifests + compact top-level inspection |
+| `exec` | One shell command; direct result or automatic persistent-session detach |
+| `exec_batch` | Multiple commands in parallel or sequentially in one MCP call |
+| `process` | Persistent process start/read/input/kill/list via a single action-based tool |
 
-### Why `exec` matters
+The older five-tool process surface was intentionally collapsed into `process` so the model has fewer tools to choose between.
 
-A short command should require one MCP call, not a `start_process` + `read_process_output` pair.
+## Efficiency changes in v0.3
 
-`exec` waits for `ROB_DC_DETACH_AFTER_MS` (2.5 seconds by default):
+### Fewer MCP round-trips
 
-- if the process exits, it returns stdout/stderr/exit code immediately;
-- if it is still running, it returns a `sessionId` and the same process continues in the background.
+`exec` still returns short-command output in the same MCP call. Longer commands auto-detach.
+
+New high-value batch operations reduce repeated calls further:
+
+- `exec_batch`: up to 12 independent commands;
+- `fs_write_many`: up to 32 independent files;
+- `fs_patch`: up to 32 independent files when using `files[]`;
+- `workspace_inspect`: replaces several common tree / Git / manifest inspection calls.
+
+### File hashing is now opt-in
+
+Earlier versions calculated SHA-256 around writes even when the caller did not need it.
+
+v0.3 only performs a full existing-file hash when:
+
+- `expectedSha256` is supplied, or
+- the caller explicitly asks for a returned hash.
+
+For a normal overwrite, the after-hash can be computed directly from the content already in memory instead of rereading the file.
+
+### Streaming search
+
+`search` no longer needs to buffer an entire repository result set before returning the first N results.
+
+It streams ripgrep output and terminates collection after either:
+
+- `maxResults` is reached, or
+- the configured output-character budget is reached.
+
+Modes:
+
+- `content`: matching lines;
+- `name`: matching paths;
+- `files`: files containing matching content.
+
+### Efficient text reads
+
+`fs_read` supports:
+
+- normal line-range streaming;
+- efficient tail reads that start near the end of the file;
+- binary/base64 prefixes;
+- optional SHA-256.
+
+This is particularly useful for large debug logs.
+
+### Efficient process output
+
+Persistent process reads are event-driven.
+
+A `process { action: "read", waitMs: ... }` call wakes as soon as:
+
+- new stdout/stderr arrives, or
+- the process exits,
+
+instead of blindly sleeping for the whole wait interval.
+
+The process output buffer is bounded. If an extremely noisy process exceeds the retained output budget, old events are dropped in batches and the response reports `droppedBeforeSeq`.
 
 ## Multi-project concurrency
 
-Rob Desktop Commander v0.2 automatically groups work by **workspace**. It first looks upward for a `.git` root; if there is no Git root it falls back to common project markers such as `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, Maven and Gradle files.
+Workspace detection first searches upward for a Git root. If none exists it falls back to common project markers, including:
 
-Work is then scheduled through independent fair pools:
+- `package.json`
+- `pyproject.toml`
+- `Cargo.toml`
+- `go.mod`
+- Maven / Gradle
+- Composer
+- Ruby
+- Elixir
+- Deno
 
-- processes: **8 global / 3 per workspace**;
+The workspace resolver uses a bounded TTL/LRU-like cache.
+
+Default scheduler limits:
+
+- child processes: **8 global / 3 per workspace**;
 - ripgrep searches: **4 global / 2 per workspace**;
 - filesystem I/O: **24 global / 8 per workspace**.
 
-The queue is round-robin by workspace, not a single FIFO. A project that submits many operations therefore cannot place every later project behind its entire backlog.
+The queue is fair round-robin by workspace, not a single FIFO. A project with a large backlog therefore cannot put every later project behind all of its queued work.
 
-Persistent or auto-detached processes continue to consume their process slot until they actually exit. This prevents a burst of calls from silently creating an unbounded number of background builds, test runners or servers.
+Auto-detached processes keep their process slot until they actually exit.
 
-Writes, patches, moves, copies and deletes also use keyed locks. Operations touching the same file/path are serialized; unrelated paths can proceed concurrently.
+Writes/patches touching the same path are serialized; unrelated paths can run concurrently.
 
-`rob_status` exposes live global/per-workspace active and queued counts, pool limits and timeout statistics.
+Queues are also bounded by default:
 
-## Requirements
+- **1000 queued operations globally**
+- **100 queued operations per workspace**
 
-- Node.js 20+
-- npm
-- Windows, macOS or Linux
-- OpenAI `tunnel-client` only when connecting from ChatGPT through Secure MCP Tunnel
+This prevents an accidental burst from consuming unbounded memory.
+
+## In-memory metrics
+
+`rob_status` reports per-tool metrics such as:
+
+- call count;
+- errors;
+- average / maximum / last duration;
+- average / maximum queue wait.
+
+It also reports pool utilization and rejection/timeout counters.
+
+By default `rob_status` does **not** include the full session list to keep its response compact. Use `includeSessions: true` when needed.
+
+## Detailed debug logging
+
+File logging is **disabled by default**.
+
+Enable it for the first days of testing with:
+
+```powershell
+$env:ROB_DC_LOG_ENABLED = "1"
+$env:ROB_DC_LOG_LEVEL = "debug"
+```
+
+or use the convenience launchers:
+
+```powershell
+.\scripts\start-debug.ps1
+```
+
+For the ChatGPT tunnel runtime:
+
+```powershell
+.\scripts\run-openai-tunnel-debug.ps1
+```
+
+Default log directory:
+
+```text
+<repository>\.rob-dc\logs
+```
+
+Logs are JSON Lines (`.jsonl`) and include events such as:
+
+- server startup;
+- tool start/end/error and duration;
+- queue wait;
+- process start/close/error/timeout/kill;
+- process exit code and duration.
+
+Payload contents are **not fully logged by default**. Strings are represented by size plus a short redacted preview. Obvious API-token patterns and secret-like keys are redacted.
+
+To include fuller payloads while debugging:
+
+```powershell
+$env:ROB_DC_LOG_INCLUDE_PAYLOADS = "1"
+```
+
+Use this only when necessary because file contents, commands or other sensitive data may then be present in the logs.
+
+Logging can also be changed without restarting through `rob_logging`:
+
+```text
+action=status
+action=enable
+action=disable
+action=flush
+action=set_level   level=debug|info|warn|error
+```
+
+Log rotation defaults to 25 MB per file and 7 files.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `ROB_DC_ALLOWED_DIRS` | user home | Filesystem-tool roots; `*` means unrestricted |
+| `ROB_DC_SHELL` | PowerShell on Windows | Shell used for shell commands |
+| `ROB_DC_TIMEOUT_MS` | 30000 | Default `exec` process lifetime |
+| `ROB_DC_DETACH_AFTER_MS` | 2500 | Time before `exec` becomes a persistent session |
+| `ROB_DC_QUEUE_TIMEOUT_MS` | 15000 | Maximum wait for a saturated pool |
+| `ROB_DC_MAX_QUEUE_GLOBAL` | 1000 | Maximum queued jobs per pool globally |
+| `ROB_DC_MAX_QUEUE_PER_WORKSPACE` | 100 | Maximum queued jobs per project in a pool |
+| `ROB_DC_SESSION_RETENTION_MS` | 600000 | Completed persistent-session retention |
+| `ROB_DC_MAX_PROCESSES` | 8 | Running child processes globally |
+| `ROB_DC_MAX_PROCESSES_PER_WORKSPACE` | 3 | Running child processes per project |
+| `ROB_DC_MAX_SEARCHES` | 4 | Concurrent searches globally |
+| `ROB_DC_MAX_SEARCHES_PER_WORKSPACE` | 2 | Concurrent searches per project |
+| `ROB_DC_MAX_IO` | 24 | Concurrent filesystem jobs globally |
+| `ROB_DC_MAX_IO_PER_WORKSPACE` | 8 | Concurrent filesystem jobs per project |
+| `ROB_DC_MAX_OUTPUT_CHARS` | 1000000 | Per-stream retained/output budget |
+| `ROB_DC_MAX_READ_BYTES` | 2000000 | Default binary/tail/patch size budget |
+| `ROB_DC_MAX_SEARCH_RESULTS` | 500 | Global search-result ceiling |
+| `ROB_DC_WORKSPACE_CACHE_TTL_MS` | 300000 | Workspace cache TTL |
+| `ROB_DC_WORKSPACE_CACHE_MAX` | 10000 | Workspace cache entry ceiling |
+| `ROB_DC_LOG_ENABLED` | 0 | Enable JSONL file logging |
+| `ROB_DC_LOG_LEVEL` | debug | Minimum file-log level |
+| `ROB_DC_LOG_DIR` | `.rob-dc\logs` | Log directory |
+| `ROB_DC_LOG_INCLUDE_PAYLOADS` | 0 | Include expanded payload data |
+| `ROB_DC_LOG_MAX_MB` | 25 | Maximum size per log file |
+| `ROB_DC_LOG_MAX_FILES` | 7 | Rotated files retained |
+| `ROB_DC_LOG_FLUSH_MS` | 250 | Buffered log flush interval |
+| `ROB_DC_LOG_BUFFER_EVENTS` | 5000 | Maximum in-memory log event queue |
+| `ROB_DC_ALLOW_DANGEROUS` | 0 | Disable the lightweight dangerous-command guard |
+
+The launch scripts default `UV_THREADPOOL_SIZE` to 8 to give concurrent filesystem operations more room on Windows.
 
 ## Install
 
@@ -105,111 +283,93 @@ npm install
 npm test
 ```
 
-Run locally:
+Normal local run:
 
 ```powershell
 .\scripts\start-local.ps1
 ```
 
-The process waits on stdin for MCP JSON-RPC. Logging goes to stderr so stdout remains a clean MCP protocol channel.
-
-## Configuration
-
-Environment variables:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `ROB_DC_ALLOWED_DIRS` | user home | Allowed roots for filesystem tools. Use `*` for unrestricted file tools. Multiple roots use the OS PATH delimiter (`;` on Windows). |
-| `ROB_DC_SHELL` | `powershell.exe` on Windows | Shell for command tools |
-| `ROB_DC_TIMEOUT_MS` | `30000` | Default command lifetime |
-| `ROB_DC_DETACH_AFTER_MS` | `2500` | Delay before `exec` turns into a persistent session |
-| `ROB_DC_QUEUE_TIMEOUT_MS` | `15000` | Maximum wait for a saturated concurrency pool |
-| `ROB_DC_MAX_PROCESSES` | `8` | Maximum simultaneously running child processes across all projects |
-| `ROB_DC_MAX_PROCESSES_PER_WORKSPACE` | `3` | Maximum child processes for one project/workspace |
-| `ROB_DC_MAX_SEARCHES` | `4` | Maximum simultaneous ripgrep searches globally |
-| `ROB_DC_MAX_SEARCHES_PER_WORKSPACE` | `2` | Maximum simultaneous searches for one project |
-| `ROB_DC_MAX_IO` | `24` | Maximum simultaneous filesystem-I/O jobs globally |
-| `ROB_DC_MAX_IO_PER_WORKSPACE` | `8` | Maximum filesystem-I/O jobs for one project |
-| `ROB_DC_MAX_OUTPUT_CHARS` | `1000000` | Per-stream output protection |
-| `ROB_DC_MAX_READ_BYTES` | `2000000` | File read/patch safety limit |
-| `ROB_DC_MAX_SEARCH_RESULTS` | `500` | Global search result cap |
-| `ROB_DC_ALLOW_DANGEROUS` | unset | Set to `1` to disable the small dangerous-command guard |
-
-For this workstation, the recommended default is:
+Debug local run:
 
 ```powershell
-$env:ROB_DC_ALLOWED_DIRS = $env:USERPROFILE
+.\scripts\start-debug.ps1
 ```
 
-## Connect to ChatGPT with OpenAI Secure MCP Tunnel
+## Connect to ChatGPT with Secure MCP Tunnel
 
-1. Create a Secure MCP Tunnel in OpenAI Platform and obtain its `tunnel_id`.
-2. Install the current OpenAI `tunnel-client` and make it available on `PATH`.
-3. Set the runtime credentials:
-
-```powershell
-$env:ROB_TUNNEL_ID = "tunnel_..."
-$env:CONTROL_PLANE_API_KEY = "sk-..."
-$env:ROB_DC_ALLOWED_DIRS = $env:USERPROFILE
-```
-
-4. Initialize and validate the local profile:
+1. Create a Secure MCP Tunnel and obtain its tunnel ID.
+2. Install/configure the OpenAI tunnel client using the project scripts.
+3. Set the required tunnel credentials.
+4. Initialize:
 
 ```powershell
 .\scripts\init-openai-tunnel.ps1
 ```
 
-5. Run it:
+5. Run normally:
 
 ```powershell
-tunnel-client run --profile rob-desktop
+.\scripts\run-openai-tunnel.ps1
 ```
 
-6. In ChatGPT, create a custom MCP server/plugin, choose **Tunnel**, select that tunnel and connect it.
+or with detailed Rob Desktop Commander logging:
 
-The private MCP server remains on the PC; `tunnel-client` makes outbound HTTPS connections rather than exposing an inbound MCP port.
-
-## Other MCP clients
-
-Any client that can launch a stdio MCP server can use:
-
-```json
-{
-  "mcpServers": {
-    "rob-desktop-commander": {
-      "command": "node",
-      "args": [
-        "C:\\path\\to\\MCP-CLI\\dist\\index.js"
-      ],
-      "env": {
-        "ROB_DC_ALLOWED_DIRS": "C:\\Users\\your-user"
-      }
-    }
-  }
-}
+```powershell
+.\scripts\run-openai-tunnel-debug.ps1
 ```
 
 ## Security model
 
 This server is intentionally powerful.
 
-`ROB_DC_ALLOWED_DIRS` constrains the dedicated filesystem tools. It is **not an operating-system sandbox for arbitrary shell commands**. A command executed through `exec` or `process_start` has the permissions of the Windows account running the server.
+`ROB_DC_ALLOWED_DIRS` restricts the dedicated filesystem tools. It is **not an operating-system sandbox for arbitrary shell commands**.
 
-For hard isolation, run Rob Desktop Commander under a dedicated OS account, VM or container with only the permissions it needs.
+Commands launched through `exec`, `exec_batch` or `process` run with the permissions of the account that started the server.
 
-A lightweight command guard blocks a small set of obvious disk/boot/shutdown commands unless `ROB_DC_ALLOW_DANGEROUS=1`. This is a guardrail, not a security boundary.
+For hard isolation, run Rob Desktop Commander under a dedicated low-privilege account, VM or container.
+
+The dangerous-command matcher is a guardrail, not a security boundary.
 
 Never expose the stdio server through an unauthenticated public proxy.
 
-## Development
+## Testing
 
 ```powershell
 npm run check
 npm test
-npm run inspector
+npm run bench
 ```
 
-The test suite includes security regressions, scheduler fairness/locking tests, a real concurrent MCP test across two workspaces, and the normal MCP smoke test. The launch scripts also default `UV_THREADPOOL_SIZE` to 8 to give concurrent filesystem work more headroom on Windows.
+The automated suite covers:
+
+- dangerous-command regressions;
+- fair concurrency;
+- same-path locking;
+- bounded queue rejection;
+- workspace detection/cache isolation;
+- streaming search limits;
+- efficient tail/range reads;
+- real concurrent MCP calls across two projects;
+- JSONL logging enable/flush/disable;
+- batch file patch/write;
+- batch command execution;
+- event-driven persistent-process reads;
+- normal MCP handshake/tool enumeration.
+
+## Local benchmark
+
+On the development PC during the v0.3 second optimization pass:
+
+| Benchmark | Result |
+| --- | ---: |
+| workspace resolver, cold + 999 warm calls | ~7.7 ms |
+| tail read ×100 | ~99 ms |
+| line 40000 range read ×20 | ~262 ms |
+| fair scheduler, 2000 jobs | ~9.9 ms |
+
+The workspace benchmark was ~61.5 ms before the second-pass exact-path cache, so that repeated-project lookup improved by roughly 8× on that run.
+
+These are local microbenchmarks, not universal performance guarantees.
 
 ## License
 

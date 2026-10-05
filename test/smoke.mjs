@@ -7,10 +7,12 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const serverPath = path.join(root, "dist", "index.js");
-const tempFile = path.join(root, ".rob-dc-smoke.tmp");
+const tempDir = path.join(root, ".rob-dc-smoke-dir");
+const tempA = path.join(tempDir, "a.txt");
+const tempB = path.join(tempDir, "b.txt");
 
 function asJson(result) {
-  assert.equal(result.isError, undefined);
+  assert.equal(result.isError, undefined, result.content?.[0]?.text);
   const block = result.content.find((item) => item.type === "text");
   assert(block && block.type === "text");
   return JSON.parse(block.text);
@@ -21,23 +23,27 @@ const transport = new StdioClientTransport({
   command: process.execPath,
   args: [serverPath],
   cwd: root,
-  env: {
-    ...process.env,
-    ROB_DC_ALLOWED_DIRS: root
-  }
+  env: { ...process.env, ROB_DC_ALLOWED_DIRS: root }
 });
 
 try {
   await client.connect(transport);
-
   const listed = await client.listTools();
-  const names = listed.tools.map((t) => t.name);
-  for (const required of ["rob_status", "fs_read", "fs_write", "fs_patch", "search", "exec", "process_read"]) {
-    assert(names.includes(required), `missing tool: ${required}`);
-  }
-  assert(names.length >= 14);
+  const names = listed.tools.map((tool) => tool.name);
+  const expected = [
+    "rob_status", "rob_logging", "fs_read", "fs_read_many", "fs_write", "fs_write_many",
+    "fs_patch", "fs_list", "fs_manage", "search", "workspace_inspect", "exec", "exec_batch", "process"
+  ];
+  for (const required of expected) assert(names.includes(required), `missing tool: ${required}`);
+  assert.equal(names.length, expected.length);
 
-  asJson(await client.callTool({ name: "rob_status", arguments: {} }));
+  const status = asJson(await client.callTool({
+    name: "rob_status",
+    arguments: { includeSessions: false, includeMetrics: true }
+  }));
+  assert.equal(status.version, "0.3.0");
+  assert(status.logging);
+  assert(status.metrics);
 
   const read = asJson(await client.callTool({
     name: "fs_read",
@@ -45,26 +51,55 @@ try {
   }));
   assert.match(read.content, /rob-desktop-commander/);
 
+  const writes = asJson(await client.callTool({
+    name: "fs_write_many",
+    arguments: {
+      files: [
+        { path: tempA, content: "one\ntwo\nthree\nfour\n", mode: "overwrite", returnSha256: true },
+        { path: tempB, content: "alpha\nbeta\n", mode: "overwrite" }
+      ]
+    }
+  }));
+  assert.equal(writes.files.length, 2);
+  assert.match(writes.files[0].sha256After, /^[a-f0-9]{64}$/);
+
+  const tail = asJson(await client.callTool({
+    name: "fs_read",
+    arguments: { path: tempA, tailLines: 2 }
+  }));
+  assert.equal(tail.content, "three\nfour");
+
+  const patched = asJson(await client.callTool({
+    name: "fs_patch",
+    arguments: {
+      files: [
+        { path: tempA, edits: [{ oldText: "three", newText: "THREE", expected: 1 }] },
+        { path: tempB, edits: [{ oldText: "alpha", newText: "ALPHA", expected: 1 }] }
+      ]
+    }
+  }));
+  assert.equal(patched.files.length, 2);
+  assert(patched.files.every((item) => item.replacements === 1));
+
+  const many = asJson(await client.callTool({
+    name: "fs_read_many",
+    arguments: { paths: [tempA, tempB], maxBytesEach: 1000 }
+  }));
+  assert.equal(many.files.length, 2);
+
   const search = asJson(await client.callTool({
     name: "search",
     arguments: { path: root, query: "Rob Desktop Commander", mode: "content", literal: true, maxResults: 20 }
   }));
   assert(search.count > 0);
 
-  asJson(await client.callTool({
-    name: "fs_write",
-    arguments: { path: tempFile, content: "alpha\n", mode: "overwrite" }
+  const inspect = asJson(await client.callTool({
+    name: "workspace_inspect",
+    arguments: { path: root, maxEntries: 50 }
   }));
-  const patched = asJson(await client.callTool({
-    name: "fs_patch",
-    arguments: { path: tempFile, edits: [{ oldText: "alpha", newText: "beta", expected: 1 }] }
-  }));
-  assert.equal(patched.replacements, 1);
-  const tempRead = asJson(await client.callTool({
-    name: "fs_read",
-    arguments: { path: tempFile }
-  }));
-  assert.match(tempRead.content, /beta/);
+  assert.equal(inspect.workspace.toLowerCase(), root.toLowerCase());
+  assert(inspect.manifests.includes("package.json"));
+  assert(inspect.git);
 
   const quick = asJson(await client.callTool({
     name: "exec",
@@ -73,40 +108,44 @@ try {
   assert.equal(quick.detached, false);
   assert.match(quick.stdout, /^v\d+/);
 
-  const slow = asJson(await client.callTool({
-    name: "exec",
+  const batch = asJson(await client.callTool({
+    name: "exec_batch",
     arguments: {
-      command: "node -e \"setTimeout(()=>console.log('late-ok'),200)\"",
-      cwd: root,
-      detachAfterMs: 10,
-      timeoutMs: 10000
+      parallel: true,
+      commands: [
+        { command: "node -e \"console.log('batch-a')\"", cwd: root, detachAfterMs: 10000 },
+        { command: "node -e \"console.log('batch-b')\"", cwd: root, detachAfterMs: 10000 }
+      ]
     }
   }));
-  assert.equal(slow.detached, true);
-  assert(slow.sessionId);
+  assert.equal(batch.results.length, 2);
+  assert(batch.results.every((item) => item.exitCode === 0));
 
-  const session = asJson(await client.callTool({
-    name: "process_read",
-    arguments: { sessionId: slow.sessionId, cursor: 0, waitMs: 2000 }
+  const started = asJson(await client.callTool({
+    name: "process",
+    arguments: {
+      action: "start",
+      command: "node -e \"setTimeout(()=>console.log('late-ok'),200)\"",
+      cwd: root
+    }
   }));
-  const sessionText = session.events.map((event) => event.text).join("");
-  assert.match(sessionText, /late-ok/);
+  assert(started.sessionId);
 
-  let finalSession = session;
-  if (finalSession.running) {
-    finalSession = asJson(await client.callTool({
-      name: "process_read",
-      arguments: { sessionId: slow.sessionId, cursor: session.cursor, waitMs: 2000 }
-    }));
-  }
-  assert.equal(finalSession.running, false);
+  const waitStarted = Date.now();
+  const session = asJson(await client.callTool({
+    name: "process",
+    arguments: { action: "read", sessionId: started.sessionId, cursor: 0, waitMs: 2000 }
+  }));
+  const waitDuration = Date.now() - waitStarted;
+  assert(waitDuration < 1500, `event-driven read waited too long: ${waitDuration}ms`);
+  assert.match(session.events.map((event) => event.text).join(""), /late-ok/);
 
   asJson(await client.callTool({
     name: "fs_manage",
-    arguments: { operation: "delete", path: tempFile, force: true }
+    arguments: { operation: "delete", path: tempDir, recursive: true, force: true }
   }));
 
-  console.log(JSON.stringify({ ok: true, toolCount: names.length, tools: names }, null, 2));
+  console.log(JSON.stringify({ ok: true, toolCount: names.length, eventDrivenWaitMs: waitDuration, tools: names }, null, 2));
 } finally {
   await client.close();
 }

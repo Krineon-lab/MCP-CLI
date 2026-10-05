@@ -107,6 +107,18 @@ await assert.rejects(
 );
 await holder;
 
+const boundedPool = new FairConcurrencyPool("bounded-test", 1, 1, 2, 1);
+const boundedHolder = boundedPool.run("a", async () => { await sleep(80); }, 1000);
+await sleep(5);
+const boundedQueued = boundedPool.run("b", async () => undefined, 1000);
+await sleep(5);
+await assert.rejects(
+  boundedPool.run("b", async () => undefined, 1000),
+  /Concurrency queue full/
+);
+await Promise.all([boundedHolder, boundedQueued]);
+assert.equal(boundedPool.snapshot().totalRejected, 1);
+
 console.log(JSON.stringify({
   ok: true,
   maxGlobal,

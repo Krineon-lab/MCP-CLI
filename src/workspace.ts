@@ -1,17 +1,18 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { config } from "./config.js";
 
-const cache = new Map<string, string>();
-const PROJECT_MARKERS = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts"];
-
-async function exists(target: string): Promise<boolean> {
-  try {
-    await fs.access(target);
-    return true;
-  } catch {
-    return false;
-  }
+interface CacheEntry {
+  workspace: string;
+  expiresAt: number;
 }
+
+const cache = new Map<string, CacheEntry>();
+const PROJECT_MARKERS = new Set([
+  "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+  "pom.xml", "build.gradle", "build.gradle.kts", "composer.json",
+  "Gemfile", "mix.exs", "deno.json", "deno.jsonc"
+]);
 
 function normalize(value: string): string {
   const resolved = path.resolve(value);
@@ -23,16 +24,54 @@ function isInside(root: string, candidate: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function cacheWorkspace(visited: string[], workspace: string): void {
+function getCached(key: string): string | undefined {
+  const entry = cache.get(key);
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return undefined;
+  }
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry.workspace;
+}
+
+function setCached(key: string, workspace: string): void {
+  cache.delete(key);
+  cache.set(key, {
+    workspace,
+    expiresAt: Date.now() + config.workspaceCacheTtlMs
+  });
+  while (cache.size > config.workspaceCacheMaxEntries) {
+    const oldest = cache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    cache.delete(oldest);
+  }
+}
+
+function cacheWorkspace(visited: string[], workspace: string, requestedPath?: string): void {
   for (const item of visited) {
-    if (isInside(workspace, item)) cache.set(item, workspace);
+    if (isInside(workspace, item)) setCached(item, workspace);
+  }
+  if (requestedPath) setCached(requestedPath, workspace);
+}
+
+async function directoryNames(dir: string): Promise<Set<string>> {
+  try {
+    const names = await fs.readdir(dir);
+    return new Set(names.map((name) => process.platform === "win32" ? name.toLowerCase() : name));
+  } catch {
+    return new Set();
   }
 }
 
 export async function workspaceForPath(input: string): Promise<string> {
   const resolved = path.resolve(input);
-  let start = resolved;
+  const normalizedRequested = normalize(resolved);
+  const directCached = getCached(normalizedRequested);
+  if (directCached) return directCached;
 
+  let start = resolved;
   try {
     const stat = await fs.stat(resolved);
     if (!stat.isDirectory()) start = path.dirname(resolved);
@@ -41,8 +80,11 @@ export async function workspaceForPath(input: string): Promise<string> {
   }
 
   const normalizedStart = normalize(start);
-  const cached = cache.get(normalizedStart);
-  if (cached) return cached;
+  const cached = getCached(normalizedStart);
+  if (cached) {
+    setCached(normalizedRequested, cached);
+    return cached;
+  }
 
   const visited: string[] = [];
   let current = start;
@@ -51,16 +93,21 @@ export async function workspaceForPath(input: string): Promise<string> {
   while (true) {
     const normalizedCurrent = normalize(current);
     visited.push(normalizedCurrent);
+    const names = await directoryNames(current);
 
-    if (await exists(path.join(current, ".git"))) {
-      const workspace = normalizedCurrent;
-      cacheWorkspace(visited, workspace);
-      return workspace;
+    if (names.has(".git")) {
+      cacheWorkspace(visited, normalizedCurrent, normalizedRequested);
+      return normalizedCurrent;
     }
 
     if (!fallback) {
-      const checks = await Promise.all(PROJECT_MARKERS.map((marker) => exists(path.join(current, marker))));
-      if (checks.some(Boolean)) fallback = normalizedCurrent;
+      for (const marker of PROJECT_MARKERS) {
+        const key = process.platform === "win32" ? marker.toLowerCase() : marker;
+        if (names.has(key)) {
+          fallback = normalizedCurrent;
+          break;
+        }
+      }
     }
 
     const parent = path.dirname(current);
@@ -69,14 +116,14 @@ export async function workspaceForPath(input: string): Promise<string> {
   }
 
   const workspace = fallback ?? normalizedStart;
-  cacheWorkspace(visited, workspace);
+  cacheWorkspace(visited, workspace, normalizedRequested);
   return workspace;
-}
-
-export function workspaceLabel(workspace: string): string {
-  return path.basename(workspace) || workspace;
 }
 
 export function clearWorkspaceCache(): void {
   cache.clear();
+}
+
+export function workspaceCacheSize(): number {
+  return cache.size;
 }

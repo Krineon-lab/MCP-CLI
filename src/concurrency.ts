@@ -2,6 +2,8 @@ export interface PoolSnapshot {
   name: string;
   maxGlobal: number;
   maxPerWorkspace: number;
+  maxQueueGlobal: number;
+  maxQueuePerWorkspace: number;
   activeGlobal: number;
   queuedGlobal: number;
   activeByWorkspace: Record<string, number>;
@@ -9,6 +11,7 @@ export interface PoolSnapshot {
   totalStarted: number;
   totalCompleted: number;
   totalTimedOut: number;
+  totalRejected: number;
 }
 
 export interface Lease {
@@ -30,16 +33,21 @@ export class FairConcurrencyPool {
   private activeByWorkspace = new Map<string, number>();
   private queues = new Map<string, Waiter[]>();
   private rotation: string[] = [];
+  private queuedGlobal = 0;
   private totalStarted = 0;
   private totalCompleted = 0;
   private totalTimedOut = 0;
+  private totalRejected = 0;
 
   constructor(
     readonly name: string,
     readonly maxGlobal: number,
-    readonly maxPerWorkspace: number
+    readonly maxPerWorkspace: number,
+    readonly maxQueueGlobal = 1_000,
+    readonly maxQueuePerWorkspace = 100
   ) {
     if (maxGlobal < 1 || maxPerWorkspace < 1) throw new Error("Concurrency limits must be >= 1");
+    if (maxQueueGlobal < 1 || maxQueuePerWorkspace < 1) throw new Error("Queue limits must be >= 1");
   }
 
   private canStart(workspace: string): boolean {
@@ -47,27 +55,31 @@ export class FairConcurrencyPool {
       (this.activeByWorkspace.get(workspace) ?? 0) < this.maxPerWorkspace;
   }
 
-  private grant(waiter: Waiter): void {
+  private createLease(workspace: string, enqueuedAt: number): Lease {
     this.activeGlobal += 1;
-    this.activeByWorkspace.set(waiter.workspace, (this.activeByWorkspace.get(waiter.workspace) ?? 0) + 1);
+    this.activeByWorkspace.set(workspace, (this.activeByWorkspace.get(workspace) ?? 0) + 1);
     this.totalStarted += 1;
-    if (waiter.timer) clearTimeout(waiter.timer);
 
     let released = false;
-    waiter.resolve({
-      workspace: waiter.workspace,
-      waitedMs: Date.now() - waiter.enqueuedAt,
+    return {
+      workspace,
+      waitedMs: Date.now() - enqueuedAt,
       release: () => {
         if (released) return;
         released = true;
         this.activeGlobal -= 1;
-        const next = (this.activeByWorkspace.get(waiter.workspace) ?? 1) - 1;
-        if (next <= 0) this.activeByWorkspace.delete(waiter.workspace);
-        else this.activeByWorkspace.set(waiter.workspace, next);
+        const next = (this.activeByWorkspace.get(workspace) ?? 1) - 1;
+        if (next <= 0) this.activeByWorkspace.delete(workspace);
+        else this.activeByWorkspace.set(workspace, next);
         this.totalCompleted += 1;
         this.drain();
       }
-    });
+    };
+  }
+
+  private grant(waiter: Waiter): void {
+    if (waiter.timer) clearTimeout(waiter.timer);
+    waiter.resolve(this.createLease(waiter.workspace, waiter.enqueuedAt));
   }
 
   private drain(): void {
@@ -90,6 +102,7 @@ export class FairConcurrencyPool {
         }
 
         const waiter = queue.shift()!;
+        this.queuedGlobal -= 1;
         if (queue.length > 0) this.rotation.push(workspace);
         else this.queues.delete(workspace);
 
@@ -106,9 +119,17 @@ export class FairConcurrencyPool {
     const hasQueuedWork = this.rotation.length > 0;
 
     if (!hasQueuedWork && this.canStart(key)) {
-      return await new Promise<Lease>((resolve, reject) => {
-        this.grant({ workspace: key, enqueuedAt: Date.now(), resolve, reject });
-      });
+      return this.createLease(key, Date.now());
+    }
+
+    const workspaceQueueLength = this.queues.get(key)?.length ?? 0;
+    if (this.queuedGlobal >= this.maxQueueGlobal || workspaceQueueLength >= this.maxQueuePerWorkspace) {
+      this.totalRejected += 1;
+      throw new Error(
+        "Concurrency queue full in " + this.name + " for workspace " + key +
+        " (global " + this.queuedGlobal + "/" + this.maxQueueGlobal +
+        ", workspace " + workspaceQueueLength + "/" + this.maxQueuePerWorkspace + ")"
+      );
     }
 
     return await new Promise<Lease>((resolve, reject) => {
@@ -119,6 +140,7 @@ export class FairConcurrencyPool {
         this.queues.set(key, [waiter]);
         this.rotation.push(key);
       }
+      this.queuedGlobal += 1;
 
       if (timeoutMs > 0) {
         waiter.timer = setTimeout(() => {
@@ -127,12 +149,13 @@ export class FairConcurrencyPool {
           const index = pending.indexOf(waiter);
           if (index < 0) return;
           pending.splice(index, 1);
+          this.queuedGlobal -= 1;
           if (pending.length === 0) {
             this.queues.delete(key);
             this.rotation = this.rotation.filter((item) => item !== key);
           }
           this.totalTimedOut += 1;
-          reject(new Error(`Concurrency queue timeout in ${this.name} for workspace ${key} after ${timeoutMs}ms`));
+          reject(new Error("Concurrency queue timeout in " + this.name + " for workspace " + key + " after " + timeoutMs + "ms"));
           this.drain();
         }, timeoutMs);
         waiter.timer.unref();
@@ -156,13 +179,16 @@ export class FairConcurrencyPool {
       name: this.name,
       maxGlobal: this.maxGlobal,
       maxPerWorkspace: this.maxPerWorkspace,
+      maxQueueGlobal: this.maxQueueGlobal,
+      maxQueuePerWorkspace: this.maxQueuePerWorkspace,
       activeGlobal: this.activeGlobal,
-      queuedGlobal: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
+      queuedGlobal: this.queuedGlobal,
       activeByWorkspace: Object.fromEntries(this.activeByWorkspace),
       queuedByWorkspace: Object.fromEntries([...this.queues].map(([key, queue]) => [key, queue.length])),
       totalStarted: this.totalStarted,
       totalCompleted: this.totalCompleted,
-      totalTimedOut: this.totalTimedOut
+      totalTimedOut: this.totalTimedOut,
+      totalRejected: this.totalRejected
     };
   }
 }
