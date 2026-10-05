@@ -297,26 +297,33 @@ Debug local run:
 
 ## Connect to ChatGPT with Secure MCP Tunnel
 
-1. Create a Secure MCP Tunnel and obtain its tunnel ID.
-2. Install/configure the OpenAI tunnel client using the project scripts.
-3. Set the required tunnel credentials.
-4. Initialize:
+1. Create a Secure MCP Tunnel in OpenAI Platform and obtain its `tunnel_...` ID.
+2. Create a restricted Runtime API key with **Tunnels Read + Use**.
+3. Run the one-time Windows setup:
 
 ```powershell
-.\scripts\init-openai-tunnel.ps1
+.\scripts\configure-tunnel-autostart.ps1
 ```
 
-5. Run normally:
+The setup:
+
+- asks for the tunnel ID and runtime key locally;
+- stores the runtime key encrypted with Windows DPAPI for the current user;
+- creates the `rob-desktop` tunnel-client profile;
+- runs `doctor`;
+- enables detailed Rob Desktop Commander logging;
+- installs the **Rob Desktop Commander** Scheduled Task;
+- starts the tunnel immediately.
+
+The Scheduled Task runs **at user logon** (rather than before login) so the current-user DPAPI secret can be decrypted safely. It restarts automatically after failures and removes any stale orphaned `rob-desktop` tunnel-client instance before starting a new one.
+
+The runtime script used by the task is:
 
 ```powershell
-.\scripts\run-openai-tunnel.ps1
+.\scripts\run-tunnel-service.ps1
 ```
 
-or with detailed Rob Desktop Commander logging:
-
-```powershell
-.\scripts\run-openai-tunnel-debug.ps1
-```
+Once the daemon is healthy, open ChatGPT connector settings, choose **Connection: Tunnel**, then select the tunnel or paste its tunnel ID. The daemon must remain running for connector discovery and every later MCP call.
 
 ## Security model
 
