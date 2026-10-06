@@ -41,7 +41,7 @@ try {
     name: "rob_status",
     arguments: { includeSessions: false, includeMetrics: true }
   }));
-  assert.equal(status.version, "0.3.1");
+  assert.equal(status.version, "0.3.2");
   assert(status.logging);
   assert(status.metrics);
 
