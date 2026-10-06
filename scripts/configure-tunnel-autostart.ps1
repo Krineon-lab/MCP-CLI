@@ -10,6 +10,7 @@ $TunnelClient = Join-Path $StateDir "bin\tunnel-client.exe"
 $TunnelIdFile = Join-Path $ConfigDir "tunnel-id.txt"
 $KeyFile = Join-Path $SecretsDir "control-plane-api-key.dpapi"
 $DebugFlag = Join-Path $ConfigDir "debug-logging.enabled"
+$ConsoleFlag = Join-Path $ConfigDir "live-console.enabled"
 $ResultFile = Join-Path $ConfigDir "setup-result.json"
 $TaskName = "Rob Desktop Commander"
 $RunScript = Join-Path $PSScriptRoot "run-tunnel-service.ps1"
@@ -55,7 +56,7 @@ try {
 
     Set-Content -Path $TunnelIdFile -Value $TunnelId -NoNewline -Encoding ASCII
     $SecureKey | ConvertFrom-SecureString | Set-Content -Path $KeyFile -NoNewline -Encoding ASCII
-    New-Item -ItemType File -Force -Path $DebugFlag | Out-Null
+    New-Item -ItemType File -Force -Path $DebugFlag,$ConsoleFlag | Out-Null
 
     $Encrypted = (Get-Content -Raw $KeyFile).Trim()
     $Secure = ConvertTo-SecureString $Encrypted
@@ -152,6 +153,7 @@ try {
     Write-Host "CONFIGURAZIONE COMPLETATA." -ForegroundColor Green
     Write-Host ("Task Windows: " + $TaskName + " [" + $task.State + "]")
     Write-Host "Debug logging: ATTIVO"
+    Write-Host "Console live: ATTIVA"
     Write-Host ("Log directory: " + $LogsDir)
     Write-Host ""
     Write-Host "Puoi chiudere questa finestra." -ForegroundColor Green

@@ -10,6 +10,8 @@ $TunnelClient = Join-Path $StateDir "bin\tunnel-client.exe"
 $TunnelIdFile = Join-Path $ConfigDir "tunnel-id.txt"
 $KeyFile = Join-Path $SecretsDir "control-plane-api-key.dpapi"
 $DebugFlag = Join-Path $ConfigDir "debug-logging.enabled"
+$ConsoleFlag = Join-Path $ConfigDir "live-console.enabled"
+$ActivityScript = Join-Path $PSScriptRoot "show-activity.ps1"
 $HealthUrlFile = Join-Path $StateDir "tunnel-health-url.txt"
 $ServiceLog = Join-Path $LogsDir ("tunnel-service-" + (Get-Date -Format "yyyy-MM-dd") + ".log")
 $TunnelLog = Join-Path $LogsDir ("tunnel-client-" + (Get-Date -Format "yyyy-MM-dd") + ".jsonl")
@@ -86,17 +88,39 @@ try {
     }
 
     # If a previous task host was terminated, tunnel-client may survive as an orphan.
-    # Remove only stale instances for this exact Rob Desktop Commander profile.
+    # Stop only the stale tunnel + its direct MCP node. Do NOT taskkill /T here:
+    # persistent workloads launched through MCP (databases, dev servers, etc.) may be
+    # descendants of that node and should survive a tunnel/server restart.
     $stale = Get-CimInstance Win32_Process -Filter "Name='tunnel-client.exe'" -ErrorAction SilentlyContinue |
         Where-Object {
             $_.CommandLine -like "*--profile rob-desktop*" -and
             $_.CommandLine -like "*$ProfileDir*"
         }
     foreach ($proc in $stale) {
-        Write-ServiceLog ("Terminating stale tunnel-client PID " + $proc.ProcessId + ".")
-        & taskkill.exe /PID $proc.ProcessId /T /F | Out-Null
+        $mcpChildren = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ParentProcessId -eq $proc.ProcessId -and
+                $_.Name -eq "node.exe" -and
+                $_.CommandLine -match "MCP-CLI[/\\]dist[/\\]index\.js"
+            })
+
+        Write-ServiceLog ("Terminating stale tunnel-client PID " + $proc.ProcessId + " without killing persistent descendants.")
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 250
+
+        foreach ($child in $mcpChildren) {
+            if (Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue) {
+                Write-ServiceLog ("Terminating stale MCP node PID " + $child.ProcessId + ".")
+                Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
-    if ($stale) { Start-Sleep -Milliseconds 750 }
+    if ($stale) { Start-Sleep -Milliseconds 500 }
+
+    if ((Test-Path $ConsoleFlag) -and (Test-Path $ActivityScript)) {
+        $ActivityArgs = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ActivityScript + '"'
+        Start-Process -FilePath "powershell.exe" -ArgumentList $ActivityArgs -WindowStyle Normal | Out-Null
+    }
 
     Remove-Item $HealthUrlFile -Force -ErrorAction SilentlyContinue
     Write-ServiceLog "Starting tunnel-client profile rob-desktop for $TunnelId."
@@ -105,6 +129,7 @@ try {
         "run",
         "--profile", "rob-desktop",
         "--profile-dir", $ProfileDir,
+        "--control-plane.poll-channel", "main",
         "--health.listen-addr", "127.0.0.1:0",
         "--health.url-file", $HealthUrlFile,
         "--log.level", $TunnelLogLevel,

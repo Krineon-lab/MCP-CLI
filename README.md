@@ -6,7 +6,7 @@ It is designed to replace the hosted Remote Desktop Commander relay for Rob's wo
 
 ## Current version
 
-**v0.3.0**
+**v0.3.1**
 
 Core goals:
 
@@ -312,8 +312,11 @@ The setup:
 - creates the `rob-desktop` tunnel-client profile;
 - runs `doctor`;
 - enables detailed Rob Desktop Commander logging;
+- enables the live activity console;
 - installs the **Rob Desktop Commander** Scheduled Task;
 - starts the tunnel immediately.
+
+The live console shows compact, color-coded activity without full payloads: file reads/writes, searches, commands, process lifecycle, durations, queue waits, errors and tunnel health. Closing the console does **not** stop the tunnel; run `.\scripts\show-activity.ps1` to reopen it manually.
 
 The Scheduled Task runs **at user logon** (rather than before login) so the current-user DPAPI secret can be decrypted safely. It restarts automatically after failures and removes any stale orphaned `rob-desktop` tunnel-client instance before starting a new one.
 

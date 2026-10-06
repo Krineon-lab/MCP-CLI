@@ -110,6 +110,29 @@ export class ProcessManager {
     this.notify(session);
   }
 
+  private finalize(session: Session, code: number | null, signal: NodeJS.Signals | null): void {
+    if (session.finishedAt !== null) return;
+    session.exitCode = code;
+    session.signal = signal;
+    session.finishedAt = Date.now();
+    session.capacityLease.release();
+    this.notify(session);
+
+    logger.debug("process.closed", {
+      sessionId: session.id,
+      pid: session.child.pid,
+      exitCode: code,
+      signal,
+      timedOut: session.timedOut,
+      durationMs: session.finishedAt - session.startedAt,
+      outputChars: session.eventChars,
+      droppedBeforeSeq: session.droppedBeforeSeq
+    });
+
+    const cleanup = setTimeout(() => this.sessions.delete(session.id), config.sessionRetentionMs);
+    cleanup.unref();
+  }
+
   async start(command: string, cwd?: string, shell?: string): Promise<Session> {
     assertCommandAllowed(command);
     const actualCwd = await assertAllowed(cwd || os.homedir());
@@ -172,27 +195,35 @@ export class ProcessManager {
       this.append(session, "stderr", `[spawn error] ${error.message}\n`);
       logger.error("process.error", { sessionId: id, pid: child.pid, message: error.message });
     });
-    child.on("close", (code, signal) => {
+    let exitDrainTimer: NodeJS.Timeout | undefined;
+    child.on("exit", (code, signal) => {
       session.exitCode = code;
       session.signal = signal;
-      session.finishedAt = Date.now();
-      session.capacityLease.release();
+
+      // Descendants can inherit stdio after the tracked shell/root exits.
+      // Node then delays "close" even though the tracked process is gone.
+      // Allow a short drain window, then release capacity and close our pipes.
+      exitDrainTimer = setTimeout(() => {
+        if (session.finishedAt !== null) return;
+        logger.warn("process.exit_drain_timeout", {
+          sessionId: id,
+          pid: child.pid,
+          exitCode: code,
+          graceMs: 500
+        });
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        this.finalize(session, code, signal);
+        resolveDone();
+      }, 500);
+      exitDrainTimer.unref();
+    });
+
+    child.on("close", (code, signal) => {
+      if (exitDrainTimer) clearTimeout(exitDrainTimer);
+      this.finalize(session, code, signal);
       resolveDone();
-      this.notify(session);
-
-      logger.debug("process.closed", {
-        sessionId: id,
-        pid: child.pid,
-        exitCode: code,
-        signal,
-        timedOut: session.timedOut,
-        durationMs: session.finishedAt - session.startedAt,
-        outputChars: session.eventChars,
-        droppedBeforeSeq: session.droppedBeforeSeq
-      });
-
-      const cleanup = setTimeout(() => this.sessions.delete(id), config.sessionRetentionMs);
-      cleanup.unref();
     });
 
     return session;
@@ -221,7 +252,13 @@ export class ProcessManager {
     const timeout = setTimeout(() => {
       session.timedOut = true;
       logger.warn("process.timeout", { sessionId: session.id, pid: session.child.pid, timeoutMs });
-      void this.kill(session.id);
+      void this.kill(session.id).catch((error) => {
+        logger.error("process.kill_failed", {
+          sessionId: session.id,
+          pid: session.child.pid,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      });
     }, timeoutMs);
     timeout.unref();
     void session.done.then(() => clearTimeout(timeout));
@@ -370,9 +407,31 @@ export class ProcessManager {
 
     if (process.platform === "win32" && pid) {
       const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      await new Promise<void>((resolve) => killer.once("close", () => resolve()));
+      const taskkillCode = await new Promise<number | null>((resolve) => killer.once("close", (code) => resolve(code)));
+      if (taskkillCode !== 0 && session.child.exitCode === null && session.child.signalCode === null) {
+        session.child.kill();
+      }
     } else {
       session.child.kill("SIGTERM");
+    }
+
+    await Promise.race([
+      session.done,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 2_000);
+        timer.unref();
+      })
+    ]);
+
+    if (session.finishedAt === null && (session.child.exitCode !== null || session.child.signalCode !== null)) {
+      session.child.stdin.destroy();
+      session.child.stdout.destroy();
+      session.child.stderr.destroy();
+      this.finalize(session, session.child.exitCode, session.child.signalCode as NodeJS.Signals | null);
+    }
+
+    if (session.finishedAt === null) {
+      throw new Error(`Failed to terminate process PID ${pid ?? "unknown"} within 2 seconds`);
     }
   }
 

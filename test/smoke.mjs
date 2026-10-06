@@ -41,7 +41,7 @@ try {
     name: "rob_status",
     arguments: { includeSessions: false, includeMetrics: true }
   }));
-  assert.equal(status.version, "0.3.0");
+  assert.equal(status.version, "0.3.1");
   assert(status.logging);
   assert(status.metrics);
 
@@ -93,6 +93,13 @@ try {
   }));
   assert(search.count > 0);
 
+  const singleFileSearch = asJson(await client.callTool({
+    name: "search",
+    arguments: { path: path.join(root, "README.md"), query: "Rob Desktop Commander", mode: "content", literal: true, maxResults: 20 }
+  }));
+  assert(singleFileSearch.count > 0);
+  assert.equal(singleFileSearch.target, "README.md");
+
   const inspect = asJson(await client.callTool({
     name: "workspace_inspect",
     arguments: { path: root, maxEntries: 50 }
@@ -107,6 +114,35 @@ try {
   }));
   assert.equal(quick.detached, false);
   assert.match(quick.stdout, /^v\d+/);
+
+  const drainStarted = Date.now();
+  const drainTimeout = asJson(await client.callTool({
+    name: "exec",
+    arguments: {
+      command: "node -e \"const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:'inherit'}); c.unref();\"",
+      cwd: root,
+      detachAfterMs: 3000,
+      timeoutMs: 300
+    }
+  }));
+  const drainDuration = Date.now() - drainStarted;
+  assert.equal(drainTimeout.detached, false);
+  assert(drainDuration < 1500, `exited root held inherited pipes too long: ${drainDuration}ms`);
+
+  const hardTimeoutStarted = Date.now();
+  const hardTimeout = asJson(await client.callTool({
+    name: "exec",
+    arguments: {
+      command: "node -e \"setTimeout(()=>{},5000)\"",
+      cwd: root,
+      detachAfterMs: 3000,
+      timeoutMs: 300
+    }
+  }));
+  const hardTimeoutDuration = Date.now() - hardTimeoutStarted;
+  assert.equal(hardTimeout.detached, false);
+  assert.equal(hardTimeout.timedOut, true);
+  assert(hardTimeoutDuration < 2000, `hard timeout took too long: ${hardTimeoutDuration}ms`);
 
   const batch = asJson(await client.callTool({
     name: "exec_batch",

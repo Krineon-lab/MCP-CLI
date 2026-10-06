@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { rgPath } from "@vscode/ripgrep";
+import { logger } from "./logger.js";
 
 interface CollectOptions {
   args: string[];
@@ -15,7 +16,12 @@ export async function collectRipgrepLines(options: CollectOptions): Promise<{
   stderr: string;
   truncated: boolean;
 }> {
-  return await new Promise((resolve, reject) => {
+  const runOnce = async () => await new Promise<{
+    code: number;
+    matches: string[];
+    stderr: string;
+    truncated: boolean;
+  }>((resolve, reject) => {
     const child = spawn(rgPath, options.args, {
       cwd: options.cwd,
       windowsHide: true,
@@ -64,8 +70,8 @@ export async function collectRipgrepLines(options: CollectOptions): Promise<{
       if (stderr.length > 64_000) stderr = stderr.slice(-64_000);
     });
 
-    child.on("error", reject);
-    child.on("close", (code) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
       if (!stoppedEarly && remainder) processLine(remainder);
       resolve({
         code: stoppedEarly ? 0 : (code ?? 0),
@@ -75,6 +81,28 @@ export async function collectRipgrepLines(options: CollectOptions): Promise<{
       });
     });
   });
+
+  const retryDelaysMs = [75, 200, 500];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await runOnce();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" || attempt >= retryDelaysMs.length) throw error;
+
+      const delayMs = retryDelaysMs[attempt];
+      logger.warn("search.ripgrep_retry", {
+        attempt: attempt + 1,
+        delayMs,
+        executable: rgPath,
+        reason: "ENOENT"
+      });
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, delayMs);
+        timer.unref();
+      });
+    }
+  }
 }
 
 export async function searchNames(options: {
@@ -119,6 +147,7 @@ export async function searchContent(options: {
   maxResults: number;
   maxChars: number;
   filesOnly: boolean;
+  target?: string;
 }) {
   const args = options.filesOnly
     ? ["--files-with-matches", "--color", "never"]
@@ -127,7 +156,7 @@ export async function searchContent(options: {
   if (options.ignoreCase) args.push("-i");
   if (options.literal) args.push("-F");
   for (const glob of options.globs) args.push("-g", glob);
-  args.push("--", options.query, ".");
+  args.push("--", options.query, options.target ?? ".");
 
   return await collectRipgrepLines({
     args,

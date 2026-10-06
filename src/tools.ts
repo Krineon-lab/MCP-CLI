@@ -585,7 +585,7 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "search",
     {
-      description: "Streaming ripgrep search that stops once enough results are collected instead of buffering an entire repository.",
+      description: "Streaming ripgrep search over a directory or a single file. Stops once enough results are collected; set literal=true for code/text containing regex metacharacters.",
       inputSchema: z.object({
         path: z.string().min(1),
         query: z.string().min(1),
@@ -601,35 +601,59 @@ export function registerTools(server: McpServer): void {
     },
     async (args) => runTool("search", args, async () => {
       const root = await assertAllowed(args.path);
+      const rootStat = await fs.stat(root);
+      const singleFile = rootStat.isFile();
+      const searchCwd = singleFile ? path.dirname(root) : root;
+      const target = singleFile ? path.basename(root) : undefined;
+
       return await runSearch(root, async (workspace, queueWaitMs) => {
         const limit = Math.min(args.maxResults, config.maxSearchResults);
         const globs = normalizeGlobs(args.glob, args.globs);
-        const result = args.mode === "name"
-          ? await searchNames({
-              cwd: root,
-              query: args.query,
-              literal: args.literal,
-              ignoreCase: args.ignoreCase,
-              includeHidden: args.includeHidden,
-              globs,
-              maxResults: limit,
-              maxChars: config.maxOutputChars
-            })
-          : await searchContent({
-              cwd: root,
-              query: args.query,
-              literal: args.literal,
-              ignoreCase: args.ignoreCase,
-              includeHidden: args.includeHidden,
-              globs,
-              maxResults: limit,
-              maxChars: config.maxOutputChars,
-              filesOnly: args.mode === "files"
-            });
 
-        if (result.code > 1) throw new Error(result.stderr || `ripgrep failed with exit code ${result.code}`);
+        let result;
+        if (singleFile && args.mode === "name") {
+          const name = path.basename(root);
+          const matched = args.literal
+            ? (args.ignoreCase ? name.toLowerCase().includes(args.query.toLowerCase()) : name.includes(args.query))
+            : new RegExp(args.query, args.ignoreCase ? "i" : undefined).test(name);
+          result = { code: 0, matches: matched ? [name] : [], stderr: "", truncated: false };
+        } else if (args.mode === "name") {
+          result = await searchNames({
+            cwd: searchCwd,
+            query: args.query,
+            literal: args.literal,
+            ignoreCase: args.ignoreCase,
+            includeHidden: args.includeHidden,
+            globs,
+            maxResults: limit,
+            maxChars: config.maxOutputChars
+          });
+        } else {
+          result = await searchContent({
+            cwd: searchCwd,
+            target,
+            query: args.query,
+            literal: args.literal,
+            ignoreCase: args.ignoreCase,
+            includeHidden: args.includeHidden,
+            globs,
+            maxResults: limit,
+            maxChars: config.maxOutputChars,
+            filesOnly: args.mode === "files"
+          });
+        }
+
+        if (result.code > 1) {
+          const detail = result.stderr || `ripgrep failed with exit code ${result.code}`;
+          const hint = /regex parse error|unclosed|invalid regex/i.test(detail)
+            ? " Hint: use literal=true when searching for literal code/text."
+            : "";
+          throw new Error(detail.trimEnd() + hint);
+        }
         return {
           root,
+          searchCwd,
+          ...(target ? { target } : {}),
           workspace,
           queueWaitMs,
           mode: args.mode,
