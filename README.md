@@ -6,7 +6,7 @@ It is designed to replace the hosted Remote Desktop Commander relay for Rob's wo
 
 ## Current version
 
-**v0.3.1**
+**v0.3.2**
 
 Core goals:
 
@@ -112,12 +112,13 @@ Modes:
 
 `fs_read` supports:
 
-- normal line-range streaming;
-- efficient tail reads that start near the end of the file;
+- fast direct line-range reads for files up to 2 MiB, avoiding async `readline` overhead;
+- bounded-memory streaming fallback for larger files;
+- adaptive backward tail reads that start at 1 KiB and grow only when more history is needed;
 - binary/base64 prefixes;
 - optional SHA-256.
 
-This is particularly useful for large debug logs.
+The fast range path does not cache file contents, so external edits are visible immediately. This is particularly useful for source files and large debug logs.
 
 ### Efficient process output
 
