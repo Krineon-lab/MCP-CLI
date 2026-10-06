@@ -317,7 +317,23 @@ The setup:
 - installs the **Rob Desktop Commander** Scheduled Task;
 - starts the tunnel immediately.
 
-The live console shows compact, color-coded activity without full payloads: file reads/writes, searches, commands, process lifecycle, durations, queue waits, errors and tunnel health. Closing the console does **not** stop the tunnel; run `.\scripts\show-activity.ps1` to reopen it manually.
+The live console shows compact, color-coded activity without full payloads: file reads/writes, searches, commands, process lifecycle, durations, queue waits, errors and tunnel health. Closing the console does **not** stop the tunnel.
+
+### Windows management command
+
+`RobDC.cmd` provides one compact control surface for day-to-day use:
+
+```powershell
+RobDC status
+RobDC start
+RobDC restart
+RobDC stop
+RobDC monitor
+RobDC monitor-stop
+RobDC logs
+```
+
+Running the repository `RobDC.cmd` without arguments opens an interactive menu. On Windows, it can optionally be copied to a directory on the user PATH (for example `%USERPROFILE%\bin`) and exposed through Desktop shortcuts for the control menu and live monitor.
 
 The Scheduled Task runs **at user logon** (rather than before login) so the current-user DPAPI secret can be decrypted safely. It restarts automatically after failures and removes any stale orphaned `rob-desktop` tunnel-client instance before starting a new one.
 
@@ -373,12 +389,12 @@ On the development PC during the v0.3 second optimization pass:
 
 | Benchmark | Result |
 | --- | ---: |
-| workspace resolver, cold + 999 warm calls | ~7.7 ms |
-| tail read ×100 | ~99 ms |
-| line 40000 range read ×20 | ~262 ms |
-| fair scheduler, 2000 jobs | ~9.9 ms |
+| workspace resolver, cold + 999 warm calls | 7.87 ms |
+| tail read ×100 | 32.23 ms |
+| line 40000 range read ×20 | 32.18 ms |
+| fair scheduler, 2000 jobs | 13.07 ms |
 
-The workspace benchmark was ~61.5 ms before the second-pass exact-path cache, so that repeated-project lookup improved by roughly 8× on that run.
+The v0.3.2 text-read optimization reduced the local tail benchmark from 81.9 ms to 32.23 ms and the line-40000 range benchmark from 263.1 ms to 32.18 ms on the development PC. The earlier workspace benchmark was ~61.5 ms before the exact-path cache.
 
 These are local microbenchmarks, not universal performance guarantees.
 
