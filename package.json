@@ -1,6 +1,6 @@
 {
   "name": "rob-desktop-commander",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Private, self-hosted MCP desktop control server for Rob",
   "type": "module",
   "private": true,
