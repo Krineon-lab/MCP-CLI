@@ -45,6 +45,22 @@ try {
   assert.equal(range.returnedLines, 3);
   assert.match(range.content, /^line-9999 needle/);
 
+  const crlf = path.join(dir, "crlf.log");
+  await fs.writeFile(crlf, "alpha\r\nbeta\r\ngamma\r\n", "utf8");
+  const crlfRange = await readTextRange(crlf, 2, 2);
+  assert.equal(crlfRange.content, "beta\ngamma");
+  assert.equal(crlfRange.returnedLines, 2);
+  assert.equal(crlfRange.hasMoreLines, false);
+
+  const beyondEof = await readTextRange(crlf, 4, 2);
+  assert.equal(beyondEof.content, "");
+  assert.equal(beyondEof.returnedLines, 0);
+
+  const noTrailingNewline = path.join(dir, "no-trailing-newline.log");
+  await fs.writeFile(noTrailingNewline, "one\ntwo\nthree", "utf8");
+  const noTrailingTail = await readTailLines(noTrailingNewline, 2, 64 * 1024);
+  assert.equal(noTrailingTail.content, "two\nthree");
+
   console.log(JSON.stringify({
     ok: true,
     streamedSearchResults: content.matches.length,
