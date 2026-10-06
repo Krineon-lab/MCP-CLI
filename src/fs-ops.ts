@@ -43,6 +43,84 @@ export async function readBinaryPrefix(file: string, maxBytes: number): Promise<
   }
 }
 
+const FAST_TEXT_RANGE_BYTES = 2 * 1024 * 1024;
+
+function readTextRangeFromString(
+  text: string,
+  offsetLine: number,
+  maxLines: number,
+  size: number
+): {
+  content: string;
+  returnedLines: number;
+  hasMoreLines: boolean;
+  scannedLines: number;
+  size: number;
+} {
+  let start = 0;
+  let currentLine = 1;
+
+  while (currentLine < offsetLine) {
+    const newline = text.indexOf("\n", start);
+    if (newline < 0) {
+      return {
+        content: "",
+        returnedLines: 0,
+        hasMoreLines: false,
+        scannedLines: Math.max(0, currentLine - 1),
+        size
+      };
+    }
+    start = newline + 1;
+    currentLine += 1;
+  }
+
+  // A final newline terminates the preceding line; it does not create a new
+  // empty line, matching readline's behavior.
+  if (start >= text.length) {
+    return {
+      content: "",
+      returnedLines: 0,
+      hasMoreLines: false,
+      scannedLines: Math.max(0, currentLine - 1),
+      size
+    };
+  }
+
+  let cursor = start;
+  let end = start;
+  let returnedLines = 0;
+
+  while (returnedLines < maxLines && cursor < text.length) {
+    const newline = text.indexOf("\n", cursor);
+    if (newline < 0) {
+      end = text.length;
+      cursor = text.length;
+      returnedLines += 1;
+      break;
+    }
+    end = newline;
+    cursor = newline + 1;
+    returnedLines += 1;
+  }
+
+  const hasMoreLines = returnedLines === maxLines && cursor < text.length;
+  let content = text.slice(start, end);
+  if (content.includes("\r")) {
+    content = content.replace(/\r\n/g, "\n").replace(/\r$/, "");
+  }
+
+  return {
+    content,
+    returnedLines,
+    hasMoreLines,
+    scannedLines: hasMoreLines
+      ? offsetLine + returnedLines
+      : offsetLine + returnedLines - 1,
+    size
+  };
+}
+
 export async function readTextRange(file: string, offsetLine: number, maxLines: number): Promise<{
   content: string;
   returnedLines: number;
@@ -50,38 +128,60 @@ export async function readTextRange(file: string, offsetLine: number, maxLines: 
   scannedLines: number;
   size: number;
 }> {
-  const stat = await fs.stat(file);
-  if (!stat.isFile()) throw new Error(`Not a file: ${file}`);
-
-  const stream = createReadStream(file, { encoding: "utf8" });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  const selected: string[] = [];
-  let lineNo = 0;
-  let hasMoreLines = false;
-
+  const handle = await fs.open(file, "r");
   try {
-    for await (const line of rl) {
-      lineNo += 1;
-      if (lineNo < offsetLine) continue;
-      if (selected.length < maxLines) {
-        selected.push(line);
-        continue;
-      }
-      hasMoreLines = true;
-      break;
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`Not a file: ${file}`);
+    if (stat.size === 0) {
+      return { content: "", returnedLines: 0, hasMoreLines: false, scannedLines: 0, size: 0 };
     }
-  } finally {
-    rl.close();
-    stream.destroy();
-  }
 
-  return {
-    content: selected.join("\n"),
-    returnedLines: selected.length,
-    hasMoreLines,
-    scannedLines: lineNo,
-    size: stat.size
-  };
+    // For the common small/medium source-file case, a single direct read plus
+    // indexOf scanning is substantially cheaper than readline's async iterator.
+    // Large files retain the bounded-memory streaming path.
+    if (stat.size <= FAST_TEXT_RANGE_BYTES) {
+      const buffer = Buffer.allocUnsafe(stat.size);
+      const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
+      return readTextRangeFromString(
+        buffer.subarray(0, bytesRead).toString("utf8"),
+        offsetLine,
+        maxLines,
+        stat.size
+      );
+    }
+
+    const stream = handle.createReadStream({ encoding: "utf8", autoClose: false });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const selected: string[] = [];
+    let lineNo = 0;
+    let hasMoreLines = false;
+
+    try {
+      for await (const line of rl) {
+        lineNo += 1;
+        if (lineNo < offsetLine) continue;
+        if (selected.length < maxLines) {
+          selected.push(line);
+          continue;
+        }
+        hasMoreLines = true;
+        break;
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+
+    return {
+      content: selected.join("\n"),
+      returnedLines: selected.length,
+      hasMoreLines,
+      scannedLines: lineNo,
+      size: stat.size
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function readTailLines(file: string, tailLines: number, maxBytes: number): Promise<{
@@ -90,28 +190,55 @@ export async function readTailLines(file: string, tailLines: number, maxBytes: n
   truncatedByBytes: boolean;
   size: number;
 }> {
-  const stat = await fs.stat(file);
-  if (!stat.isFile()) throw new Error(`Not a file: ${file}`);
-  if (stat.size === 0) return { content: "", returnedLines: 0, truncatedByBytes: false, size: 0 };
-
-  const bytesToRead = Math.min(stat.size, maxBytes);
-  const start = stat.size - bytesToRead;
   const handle = await fs.open(file, "r");
   try {
-    const buffer = Buffer.allocUnsafe(bytesToRead);
-    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, start);
-    let text = buffer.subarray(0, bytesRead).toString("utf8");
-    if (start > 0) {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`Not a file: ${file}`);
+    if (stat.size === 0) return { content: "", returnedLines: 0, truncatedByBytes: false, size: 0 };
+
+    // Read backwards only until we have enough line breaks. Start small for the
+    // common short-tail case, then grow exponentially so large/long lines do
+    // not degenerate into many tiny syscalls.
+    const chunks: Buffer[] = [];
+    let position = stat.size;
+    let totalBytes = 0;
+    let newlineCount = 0;
+    let blockBytes = 1024;
+
+    while (position > 0 && totalBytes < maxBytes && newlineCount <= tailLines) {
+      const length = Math.min(blockBytes, position, maxBytes - totalBytes);
+      position -= length;
+
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, position);
+      const chunk = buffer.subarray(0, bytesRead);
+      chunks.unshift(chunk);
+      totalBytes += bytesRead;
+
+      for (let i = 0; i < chunk.length; i += 1) {
+        if (chunk[i] === 0x0a) newlineCount += 1;
+      }
+
+      blockBytes = Math.min(blockBytes * 2, 64 * 1024);
+    }
+
+    let text = Buffer.concat(chunks, totalBytes).toString("utf8");
+    if (position > 0) {
+      // The first decoded bytes may begin in the middle of a line (or a UTF-8
+      // code point). Discard through the first LF; all retained bytes then start
+      // at a valid line boundary.
       const firstBreak = text.indexOf("\n");
       text = firstBreak >= 0 ? text.slice(firstBreak + 1) : "";
     }
+
     let lines = text.split(/\r?\n/);
     if (lines.length > 0 && lines[lines.length - 1] === "") lines = lines.slice(0, -1);
     const selected = lines.slice(-tailLines);
+
     return {
       content: selected.join("\n"),
       returnedLines: selected.length,
-      truncatedByBytes: start > 0,
+      truncatedByBytes: position > 0 && totalBytes >= maxBytes && newlineCount <= tailLines,
       size: stat.size
     };
   } finally {
