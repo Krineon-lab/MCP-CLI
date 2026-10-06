@@ -118,8 +118,14 @@ try {
     if ($stale) { Start-Sleep -Milliseconds 500 }
 
     if ((Test-Path $ConsoleFlag) -and (Test-Path $ActivityScript)) {
-        $ActivityArgs = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ActivityScript + '"'
-        Start-Process -FilePath "powershell.exe" -ArgumentList $ActivityArgs -WindowStyle Normal | Out-Null
+        $WindowsTerminal = Get-Command "wt.exe" -ErrorAction SilentlyContinue
+        if ($WindowsTerminal) {
+            $ActivityArgs = 'new-tab --title "Rob Desktop Commander - Live Activity" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ActivityScript + '"'
+            Start-Process -FilePath $WindowsTerminal.Source -ArgumentList $ActivityArgs | Out-Null
+        } else {
+            $ActivityArgs = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ActivityScript + '"'
+            Start-Process -FilePath "powershell.exe" -ArgumentList $ActivityArgs -WindowStyle Normal | Out-Null
+        }
     }
 
     Remove-Item $HealthUrlFile -Force -ErrorAction SilentlyContinue
